@@ -1,0 +1,650 @@
+
+-- AER AutoFarm Script v2 (fixed)
+-- Полный аудит и переработка. Оригинальный дизайн AER HUB сохранён.
+
+--// Services
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+--// Config
+local Config = {
+    AutoFarm = false,
+    FarmMethod = "Legit",
+    WalkSpeed = 16,
+    JumpPower = 50,
+    Bhop = false,
+    BhopPower = 5,
+    AutoShoot = false,
+    AutoFlingSheriff = false,
+    KillAura = false,
+    InfiniteJump = false,
+    CoinCollect = false,
+}
+
+--// AER Library
+local AER = {
+    Theme = {
+        Background = Color3.fromRGB(15, 15, 20),
+        Secondary = Color3.fromRGB(25, 25, 30),
+        Accent = Color3.fromRGB(0, 170, 255),
+        AccentSecondary = Color3.fromRGB(0, 100, 200),
+        Text = Color3.fromRGB(240, 240, 240),
+        SubText = Color3.fromRGB(150, 150, 150),
+        Outline = Color3.fromRGB(45, 45, 50),
+        Success = Color3.fromRGB(0, 200, 100),
+        Danger = Color3.fromRGB(230, 70, 70),
+    },
+    Flags = {},
+    Connections = {},
+    Font = Enum.Font.GothamMedium,
+    FontBold = Enum.Font.GothamBold,
+    FontSemi = Enum.Font.GothamSemibold,
+}
+
+function AER:Create(className, properties, children)
+    local instance = Instance.new(className)
+    for prop, value in pairs(properties or {}) do
+        instance[prop] = value
+    end
+    if children then
+        for _, child in ipairs(children) do
+            child.Parent = instance
+        end
+    end
+    return instance
+end
+
+-- FIX #1: правильное создание UICorner
+function AER:Round(instance, radius)
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, radius)
+    corner.Parent = instance
+    return corner
+end
+
+function AER:GetTween(instance, duration, properties, style, direction)
+    return TweenService:Create(instance, TweenInfo.new(duration or 0.3, style or Enum.EasingStyle.Quint, direction or Enum.EasingDirection.Out), properties)
+end
+
+function AER:Window(title, subtitle, logo)
+    local ScreenGui = self:Create("ScreenGui", {
+        Name = "AER_Hub",
+        ResetOnSpawn = false,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        Parent = CoreGui,
+        IgnoreGuiInset = true,
+    })
+
+    local Main = self:Create("Frame", {
+        Parent = ScreenGui,
+        Name = "Main",
+        Size = UDim2.fromOffset(600, 400),
+        Position = UDim2.fromScale(0.5, 0.5),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        BackgroundColor3 = self.Theme.Background,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+    })
+    self:Round(Main, 12)
+
+    self:Create("UIStroke", {
+        Parent = Main,
+        Color = self.Theme.Outline,
+        Thickness = 1,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    })
+
+    local SideBar = self:Create("Frame", {
+        Parent = Main,
+        Name = "SideBar",
+        Size = UDim2.new(0, 150, 1, 0),
+        BackgroundColor3 = self.Theme.Secondary,
+        BorderSizePixel = 0,
+    })
+
+    -- Dragging
+    local dragging, dragInput, dragStart, startPos
+    local titleBar = self:Create("Frame", {
+        Parent = Main,
+        Name = "TitleBar",
+        Size = UDim2.new(1, 0, 0, 35),
+        BackgroundTransparency = 1,
+        ZIndex = 5,
+    })
+
+    local dragStartInput, startPosInput
+    local function dragUpdate(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            Main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end
+
+    titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = Main.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(dragUpdate)
+
+    -- Title
+    self:Create("ImageLabel", {
+        Parent = titleBar,
+        Size = UDim2.fromOffset(24, 24),
+        Position = UDim2.fromOffset(10, 5),
+        BackgroundTransparency = 1,
+        Image = logo or "rbxassetid://10709798833",
+    })
+    self:Create("TextLabel", {
+        Parent = titleBar,
+        Size = UDim2.new(1, -40, 1, 0),
+        Position = UDim2.fromOffset(40, 0),
+        BackgroundTransparency = 1,
+        Text = title,
+        TextColor3 = self.Theme.Text,
+        Font = self.FontBold,
+        TextSize = 16,
+        TextXAlignment = Enum.TextXAlignment.Left
+    })
+    self:Create("TextLabel", {
+        Parent = titleBar,
+        Size = UDim2.new(1, -40, 1, 0),
+        Position = UDim2.fromOffset(-10, 0),
+        AnchorPoint = Vector2.new(1, 0),
+        BackgroundTransparency = 1,
+        Text = subtitle,
+        TextColor3 = self.Theme.SubText,
+        Font = self.Font,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Right
+    })
+
+    local TabList = self:Create("Frame", {
+        Parent = SideBar,
+        Name = "TabList",
+        Size = UDim2.new(1, 0, 1, -50),
+        Position = UDim2.fromOffset(0, 50),
+        BackgroundTransparency = 1,
+    })
+    self:Create("UIListLayout", {
+        Parent = TabList,
+        Padding = UDim.new(0, 4),
+        SortOrder = Enum.SortOrder.LayoutOrder
+    })
+
+    local Content = self:Create("Frame", {
+        Parent = Main,
+        Name = "Content",
+        Size = UDim2.new(1, -150, 1, -35),
+        Position = UDim2.fromOffset(150, 35),
+        BackgroundTransparency = 1,
+    })
+
+    local Window = {Tabs = {}, ActiveTab = nil, Main = Main, Content = Content, TabList = TabList}
+
+    -- FIX #2: правильное замыкание AER внутри Window:Tab
+    local AERref = self
+    function Window:Tab(options)
+        local tab = {}
+        tab.Content = AERref:Create("ScrollingFrame", {
+            Parent = Window.Content,
+            Name = options.Name .. "Container",
+            Size = UDim2.new(1, -20, 1, -20),
+            Position = UDim2.fromOffset(10, 10),
+            BackgroundTransparency = 1,
+            Visible = false,
+            BorderSizePixel = 0,
+            ScrollBarThickness = 2,
+            ScrollBarImageColor3 = AERref.Theme.AccentSecondary,
+            CanvasSize = UDim2.new(0, 0, 0, 0),
+            AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        })
+        AERref:Create("UIListLayout", {
+            Parent = tab.Content,
+            Padding = UDim.new(0, 6),
+            SortOrder = Enum.SortOrder.LayoutOrder
+        })
+
+        local tabButton = AERref:Create("TextButton", {
+            Parent = Window.TabList,
+            Size = UDim2.new(1, -10, 0, 32),
+            Position = UDim2.fromOffset(5, 0),
+            BackgroundColor3 = AERref.Theme.Background,
+            Text = "",
+            AutoButtonColor = false,
+        })
+        AERref:Round(tabButton, 6)
+        AERref:Create("UIStroke", {Parent = tabButton, Color = AERref.Theme.Outline, Thickness = 1, ApplyStrokeMode = Enum.ApplyStrokeMode.Border})
+
+        local tabLabel = AERref:Create("TextLabel", {
+            Parent = tabButton,
+            Size = UDim2.new(1, -10, 1, 0),
+            Position = UDim2.fromOffset(10, 0),
+            BackgroundTransparency = 1,
+            Text = options.Name,
+            TextColor3 = AERref.Theme.SubText,
+            Font = AERref.Font,
+            TextSize = 13,
+            TextXAlignment = Enum.TextXAlignment.Left
+        })
+
+        tab.ButtonFrame = tabButton
+        tab.ButtonLabel = tabLabel
+        tab.Name = options.Name
+
+        -- FIX #3: корректное переключение вкладок
+        tabButton.MouseButton1Click:Connect(function()
+            if Window.ActiveTab == tab then return end
+            if Window.ActiveTab then
+                Window.ActiveTab.Content.Visible = false
+                AERref:GetTween(Window.ActiveTab.ButtonFrame, 0.2, {BackgroundColor3 = AERref.Theme.Background}):Play()
+                AERref:GetTween(Window.ActiveTab.ButtonLabel, 0.2, {TextColor3 = AERref.Theme.SubText}):Play()
+            end
+            Window.ActiveTab = tab
+            tab.Content.Visible = true
+            AERref:GetTween(tabButton, 0.2, {BackgroundColor3 = AERref.Theme.Secondary}):Play()
+            AERref:GetTween(tabLabel, 0.2, {TextColor3 = AERref.Theme.Text}):Play()
+        end)
+
+        table.insert(Window.Tabs, tab)
+        if not Window.ActiveTab then
+            Window.ActiveTab = tab
+            tab.Content.Visible = true
+            tabButton.BackgroundColor3 = AERref.Theme.Secondary
+            tabLabel.TextColor3 = AERref.Theme.Text
+        end
+
+        -- FIX #4: правильные self внутри SectionAPI
+        local TabAPI = {}
+        TabAPI.Section = function(_, sectionOptions)
+            local section = {}
+            section.Frame = AERref:Create("Frame", {
+                Parent = tab.Content,
+                Name = "Section",
+                Size = UDim2.new(1, 0, 0, 0),
+                BackgroundTransparency = 1,
+                AutomaticSize = Enum.AutomaticSize.Y,
+            })
+            AERref:Create("UIListLayout", {Parent = section.Frame, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder})
+            AERref:Create("TextLabel", {
+                Parent = section.Frame,
+                Size = UDim2.new(1, 0, 0, 20),
+                BackgroundTransparency = 1,
+                Text = sectionOptions.Name,
+                TextColor3 = AERref.Theme.SubText,
+                Font = AERref.FontSemi,
+                TextSize = 12,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                LayoutOrder = -1,
+            })
+
+            local SectionAPI = {}
+
+            SectionAPI.Toggle = function(_, toggleOptions)
+                local flag = toggleOptions.Flag or toggleOptions.Text
+                AERref.Flags[flag] = toggleOptions.Default or false
+                local frame = AERref:Create("Frame", {Parent = section.Frame, Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = AERref.Theme.Background, LayoutOrder = toggleOptions.Order})
+                AERref:Round(frame, 6)
+                AERref:Create("UIStroke", {Parent = frame, Color = AERref.Theme.Outline, Thickness = 1})
+                AERref:Create("TextLabel", {Parent = frame, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(1, -60, 1, 0), BackgroundTransparency = 1, Text = toggleOptions.Text, TextColor3 = AERref.Theme.Text, Font = AERref.Font, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left})
+
+                local buttonFrame = AERref:Create("Frame", {Parent = frame, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0), Size = UDim2.fromOffset(40, 20), BackgroundColor3 = AERref.Theme.Secondary})
+                AERref:Round(buttonFrame, 10)
+                local circle = AERref:Create("Frame", {Parent = buttonFrame, AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 2, 0.5, 0), Size = UDim2.fromOffset(16, 16), BackgroundColor3 = AERref.Theme.SubText})
+                AERref:Round(circle, 8)
+
+                local isToggled = AERref.Flags[flag]
+                local function updateVisuals(instant)
+                    local tweenInfo = instant and TweenInfo.new(0) or TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+                    if isToggled then
+                        TweenService:Create(buttonFrame, tweenInfo, {BackgroundColor3 = AERref.Theme.Accent}):Play()
+                        TweenService:Create(circle, tweenInfo, {Position = UDim2.new(1, -18, 0.5, 0), BackgroundColor3 = AERref.Theme.Text}):Play()
+                    else
+                        TweenService:Create(buttonFrame, tweenInfo, {BackgroundColor3 = AERref.Theme.Secondary}):Play()
+                        TweenService:Create(circle, tweenInfo, {Position = UDim2.new(0, 2, 0.5, 0), BackgroundColor3 = AERref.Theme.SubText}):Play()
+                    end
+                end
+                updateVisuals(true)
+
+                local toggleButton = AERref:Create("TextButton", {Parent = frame, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = ""})
+                toggleButton.MouseButton1Click:Connect(function()
+                    isToggled = not isToggled
+                    AERref.Flags[flag] = isToggled
+                    updateVisuals(false)
+                    if toggleOptions.Callback then task.spawn(toggleOptions.Callback, isToggled) end
+                end)
+
+                return {
+                    Set = function(_, value)
+                        if isToggled ~= value then
+                            isToggled = value
+                            AERref.Flags[flag] = value
+                            updateVisuals(false)
+                            if toggleOptions.Callback then task.spawn(toggleOptions.Callback, value) end
+                        end
+                    end
+                }
+            end
+
+            SectionAPI.Slider = function(_, sliderOptions)
+                local flag = sliderOptions.Flag or sliderOptions.Text
+                AERref.Flags[flag] = sliderOptions.Default or sliderOptions.Min
+                local frame = AERref:Create("Frame", {Parent = section.Frame, Size = UDim2.new(1, 0, 0, 50), BackgroundColor3 = AERref.Theme.Background, LayoutOrder = sliderOptions.Order})
+                AERref:Round(frame, 6)
+                AERref:Create("UIStroke", {Parent = frame, Color = AERref.Theme.Outline, Thickness = 1})
+                AERref:Create("TextLabel", {Parent = frame, Position = UDim2.fromOffset(10, 5), Size = UDim2.new(1, -70, 0, 15), BackgroundTransparency = 1, Text = sliderOptions.Text, TextColor3 = AERref.Theme.Text, Font = AERref.Font, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left})
+
+                -- FIX #13: правильная позиция valueLabel
+                local valueLabel = AERref:Create("TextLabel", {Parent = frame, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -10, 0, 5), Size = UDim2.new(0, 50, 0, 15), BackgroundTransparency = 1, Text = tostring(AERref.Flags[flag]), TextColor3 = AERref.Theme.Accent, Font = AERref.Font, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Right})
+
+                local bar = AERref:Create("Frame", {Parent = frame, Position = UDim2.fromOffset(10, 30), Size = UDim2.new(1, -20, 0, 6), BackgroundColor3 = AERref.Theme.Secondary})
+                AERref:Round(bar, 3)
+                local fill = AERref:Create("Frame", {Parent = bar, Size = UDim2.new((AERref.Flags[flag] - sliderOptions.Min) / (sliderOptions.Max - sliderOptions.Min), 0, 1, 0), BackgroundColor3 = AERref.Theme.Accent})
+                AERref:Round(fill, 3)
+
+                local function updateValue(input)
+                    local percentage = math.clamp((input.Position.X - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
+                    local value = math.floor(sliderOptions.Min + (sliderOptions.Max - sliderOptions.Min) * percentage + 0.5)
+                    AERref.Flags[flag] = value
+                    valueLabel.Text = tostring(value)
+                    AERref:GetTween(fill, 0.1, {Size = UDim2.new(percentage, 0, 1, 0)}):Play()
+                    if sliderOptions.Callback then task.spawn(sliderOptions.Callback, value) end
+                end
+
+                -- FIX #13: touch support
+                local sliderButton = AERref:Create("TextButton", {Parent = frame, Size = UDim2.new(1, 0, 0, 25), Position = UDim2.fromOffset(0, 25), BackgroundTransparency = 1, Text = ""})
+                local dragging = false
+                sliderButton.InputBegan:Connect(function(input)
+                    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        dragging = true
+                        updateValue(input)
+                    end
+                end)
+                local changeConn = UserInputService.InputChanged:Connect(function(input)
+                    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                        updateValue(input)
+                    end
+                end)
+                local endConn = UserInputService.InputEnded:Connect(function(input)
+                    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        dragging = false
+                    end
+                end)
+                table.insert(AERref.Connections, changeConn)
+                table.insert(AERref.Connections, endConn)
+
+                return {
+                    Set = function(_, value)
+                        AERref.Flags[flag] = value
+                        valueLabel.Text = tostring(value)
+                        local percentage = (value - sliderOptions.Min) / (sliderOptions.Max - sliderOptions.Min)
+                        AERref:GetTween(fill, 0.1, {Size = UDim2.new(percentage, 0, 1, 0)}):Play()
+                        if sliderOptions.Callback then task.spawn(sliderOptions.Callback, value) end
+                    end
+                }
+            end
+
+            SectionAPI.Button = function(_, buttonOptions)
+                local button = AERref:Create("TextButton", {Parent = section.Frame, Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = AERref.Theme.Secondary, Text = "", LayoutOrder = buttonOptions.Order, AutoButtonColor = false})
+                AERref:Round(button, 6)
+                AERref:Create("UIStroke", {Parent = button, Color = AERref.Theme.Outline, Thickness = 1})
+                AERref:Create("TextLabel", {Parent = button, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = buttonOptions.Text, TextColor3 = AERref.Theme.Text, Font = AERref.Font, TextSize = 13})
+
+                button.MouseEnter:Connect(function() AERref:GetTween(button, 0.2, {BackgroundColor3 = AERref.Theme.AccentSecondary}):Play() end)
+                button.MouseLeave:Connect(function() AERref:GetTween(button, 0.2, {BackgroundColor3 = AERref.Theme.Secondary}):Play() end)
+
+                button.MouseButton1Click:Connect(function()
+                    if buttonOptions.Callback then task.spawn(buttonOptions.Callback) end
+                end)
+            end
+
+            -- FIX #5: реализован Dropdown
+            SectionAPI.Dropdown = function(_, dropOptions)
+                local flag = dropOptions.Flag or dropOptions.Text
+                local values = dropOptions.Options or {}
+                AERref.Flags[flag] = dropOptions.Default or values[1]
+                local currentValue = AERref.Flags[flag]
+                local isOpen = false
+
+                local container = AERref:Create("Frame", {Parent = section.Frame, Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = AERref.Theme.Background, LayoutOrder = dropOptions.Order, ClipsDescendants = true})
+                AERref:Round(container, 6)
+                AERref:Create("UIStroke", {Parent = container, Color = AERref.Theme.Outline, Thickness = 1})
+
+                AERref:Create("TextLabel", {Parent = container, Position = UDim2.fromOffset(10, 0), Size = UDim2.new(0.5, -10, 0, 34), BackgroundTransparency = 1, Text = dropOptions.Text, TextColor3 = AERref.Theme.Text, Font = AERref.Font, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Left})
+                local currentLabel = AERref:Create("TextLabel", {Parent = container, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -10, 0, 0), Size = UDim2.new(0.5, -20, 0, 34), BackgroundTransparency = 1, Text = tostring(currentValue), TextColor3 = AERref.Theme.Accent, Font = AERref.Font, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Right})
+
+                local list = AERref:Create("Frame", {Parent = container, Position = UDim2.fromOffset(0, 34), Size = UDim2.new(1, 0, 0, 0), BackgroundColor3 = AERref.Theme.Secondary, AutomaticSize = Enum.AutomaticSize.Y})
+                AERref:Create("UIListLayout", {Parent = list, Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder})
+                AERref:Create("UIPadding", {Parent = list, PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4)})
+
+                local optionButtons = {}
+                for i, opt in ipairs(values) do
+                    local btn = AERref:Create("TextButton", {Parent = list, Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = AERref.Theme.Background, Text = "", LayoutOrder = i, AutoButtonColor = false})
+                    AERref:Round(btn, 4)
+                    AERref:Create("TextLabel", {Parent = btn, Size = UDim2.new(1, -20, 1, 0), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1, Text = opt, TextColor3 = AERref.Theme.Text, Font = AERref.Font, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left})
+                    btn.MouseEnter:Connect(function() AERref:GetTween(btn, 0.15, {BackgroundColor3 = AERref.Theme.AccentSecondary}):Play() end)
+                    btn.MouseLeave:Connect(function() AERref:GetTween(btn, 0.15, {BackgroundColor3 = AERref.Theme.Background}):Play() end)
+                    btn.MouseButton1Click:Connect(function()
+                        currentValue = opt
+                        AERref.Flags[flag] = opt
+                        currentLabel.Text = opt
+                        isOpen = false
+                        AERref:GetTween(container, 0.2, {Size = UDim2.new(1, 0, 0, 34)}):Play()
+                        if dropOptions.Callback then task.spawn(dropOptions.Callback, opt) end
+                    end)
+                    table.insert(optionButtons, btn)
+                end
+
+                local headerBtn = AERref:Create("TextButton", {Parent = container, Size = UDim2.new(1, 0, 0, 34), BackgroundTransparency = 1, Text = ""})
+                headerBtn.MouseButton1Click:Connect(function()
+                    isOpen = not isOpen
+                    AERref:GetTween(container, 0.2, {Size = isOpen and UDim2.new(1, 0, 0, 34 + #values * 30 + 8) or UDim2.new(1, 0, 0, 34)}):Play()
+                end)
+
+                return {
+                    Set = function(_, value)
+                        currentValue = value
+                        AERref.Flags[flag] = value
+                        currentLabel.Text = tostring(value)
+                        if dropOptions.Callback then task.spawn(dropOptions.Callback, value) end
+                    end
+                }
+            end
+
+            return SectionAPI
+        end
+
+        return TabAPI
+    end
+
+    return Window
+end
+
+--// Anti-Fling
+local function AntiFling()
+    local conn = LocalPlayer.CharacterAdded:Connect(function(char)
+        local root = char:WaitForChild("HumanoidRootPart")
+        local antiFlingConn = RunService.Heartbeat:Connect(function()
+            if not Config.AutoFarm then antiFlingConn:Disconnect() return end
+            if root and root.Parent and root.AssemblyAngularVelocity.Magnitude > 50 then
+                root.AssemblyAngularVelocity = Vector3.zero
+            end
+        end)
+        table.insert(AER.Connections, antiFlingConn)
+    end)
+    table.insert(AER.Connections, conn)
+end
+
+--// Infinite Jump
+UserInputService.JumpRequest:Connect(function()
+    if Config.InfiniteJump then
+        local humanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if humanoid and humanoid.Health > 0 then
+            pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.Jumping) end)
+        end
+    end
+end)
+
+--// Walk Speed
+RunService.Stepped:Connect(function()
+    local humanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+    humanoid.WalkSpeed = (Config.AutoFarm and Config.WalkSpeed > 16) and Config.WalkSpeed or 16
+end)
+
+--// Jump Power
+RunService.Stepped:Connect(function()
+    local humanoid = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+    humanoid.UseJumpPower = true
+    humanoid.JumpPower = (Config.AutoFarm and Config.JumpPower > 50) and Config.JumpPower or 50
+end)
+
+--// Bhop
+local bhopState = {speed = 0, landedAt = 0, wasGrounded = true}
+RunService.Heartbeat:Connect(function()
+    if not Config.AutoFarm or not Config.Bhop then
+        bhopState.speed = 0
+        return
+    end
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not (humanoid and root and humanoid.Health > 0) then
+        bhopState.wasGrounded, bhopState.speed = true, 0
+        return
+    end
+    local stateTypes = Enum.HumanoidStateType
+    local status = humanoid:GetState()
+    if status == stateTypes.Climbing or status == stateTypes.Freefall then return end
+    local grounded = humanoid.FloorMaterial ~= Enum.Material.Air and status ~= stateTypes.Jumping
+    local now = os.clock()
+    local velocity = root.AssemblyLinearVelocity
+    local power, walkSpeed = Config.BhopPower, humanoid.WalkSpeed
+
+    if grounded and not bhopState.wasGrounded then bhopState.landedAt = now end
+    if not grounded and bhopState.wasGrounded and velocity.Y > 2 and humanoid.MoveDirection.Magnitude > 0.1 then
+        bhopState.speed = bhopState.speed > 0 and (now - bhopState.landedAt <= 0.25) and (bhopState.speed + 2 + power * 1.2) or math.max(bhopState.speed, walkSpeed + 2 + power)
+    end
+    if grounded and now - bhopState.landedAt > 0.3 then bhopState.speed = 0 end
+
+    local movement = humanoid.MoveDirection
+    if bhopState.speed > 0 and movement.Magnitude > 0.1 then
+        bhopState.speed = math.min(bhopState.speed, math.max(walkSpeed * (2 + 0.4 * power), 100))
+        if not grounded or now - bhopState.landedAt <= 0.25 then
+            local direction = Vector3.new(movement.X, 0, movement.Z).Unit
+            root.AssemblyLinearVelocity = Vector3.new(direction.X * bhopState.speed, velocity.Y, direction.Z * bhopState.speed)
+        end
+    end
+    bhopState.wasGrounded = grounded
+end)
+
+--// getPlayersWithRole (FIX #8)
+local function getPlayersWithRole(roleName)
+    local result = {}
+    local modules = ReplicatedStorage:FindFirstChild("Modules")
+    local source = modules and modules:FindFirstChild("Client") and modules.Client:FindFirstChild("CurrentRoundClient")
+    if source and source:IsA("ModuleScript") then
+        local ok, module = pcall(require, source)
+        if ok and type(module) == "table" and type(module.GetLatestPlayerData) == "function" then
+            local success, data = pcall(module.GetLatestPlayerData)
+            if success and type(data) == "table" then
+                for playerName, roleData in pairs(data) do
+                    if type(roleData) == "table" and roleData.Role == roleName and not roleData.Dead and not roleData.Killed then
+                        local plr = Players:FindFirstChild(playerName)
+                        if plr then table.insert(result, plr) end
+                    end
+                end
+            end
+        end
+    end
+    if #result == 0 then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character then
+                for _, tool in ipairs(p.Character:GetChildren()) do
+                    if tool:IsA("Tool") and string.find(string.lower(tool.Name), string.lower(roleName)) then
+                        table.insert(result, p)
+                        break
+                    end
+                end
+            end
+        end
+    end
+    return result
+end
+
+--// AutoShoot (FIX #9)
+local function setupAutoShoot()
+    if not Config.AutoFarm or not Config.AutoShoot then return end
+    return RunService.RenderStepped:Connect(function()
+        local murderers = getPlayersWithRole("Murderer")
+        if #murderers == 0 then return end
+        local gun = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Gun")
+        if not gun then return end
+        local murderer = murderers[1]
+        local mChar = murderer and murderer.Character
+        local mRoot = mChar and mChar:FindFirstChild("HumanoidRootPart")
+        local mHead = mChar and mChar:FindFirstChild("Head")
+        local camera = Workspace.CurrentCamera
+        if not (mRoot and camera) then return end
+        camera.CFrame = CFrame.new(camera.CFrame.Position, mRoot.Position)
+        local fire = gun:FindFirstChild("Fire")
+        if fire and fire:IsA("RemoteEvent") then
+            pcall(function() fire:FireServer(mRoot.Position, mHead) end)
+        end
+    end)
+end
+
+--// AutoFling (FIX #10)
+local function setupAutoFling()
+    if not Config.AutoFarm or not Config.AutoFlingSheriff then return end
+    return RunService.Heartbeat:Connect(function()
+        local sheriffs = getPlayersWithRole("Sheriff")
+        if #sheriffs == 0 then return end
+        local target = sheriffs[1]
+        local tChar = target and target.Character
+        local tRoot = tChar and tChar:FindFirstChild("HumanoidRootPart")
+        local lRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if not (tRoot and lRoot) then return end
+        if (tRoot.Position - lRoot.Position).Magnitude < 10 then
+            for _, part in ipairs(tChar:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    local ok = pcall(function()
+                        part.AssemblyLinearVelocity = Vector3.new(math.huge, math.huge, math.huge)
+                    end)
+                    if ok then break end
+                end
+            end
+        end
+    end)
+end
+
+--// KillAura (FIX #11)
+local function setupKillAura()
+    if not Config.AutoFarm or Config.FarmMethod ~= "Aggressive" or not Config.KillAura then return end
+    if not firetouchinterest then return end
+    return RunService.Heartbeat:Connect(function()
+        local lChar = LocalPlayer.Character
+        local lRoot = lChar and lChar:FindFirstChild("HumanoidRootPart")
+        if not lRoot then return end
+        local targets = getPlayersWithRole("Murderer")
+        if #targets == 0 then
+            for _, player in ipairs(Players:GetPlayers()) do
+                if player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+                    table.insert(targets, player)
+                end
+            end
+        end
+        for _, target in ipairs(targets) do
