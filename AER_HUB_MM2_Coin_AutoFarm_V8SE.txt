@@ -1,0 +1,1958 @@
+--[[ AER HUB MM2 COIN AUTO FARM V8SE | LOW-SPEC / LDPLAYER FRIENDLY ]]
+
+--[[
+    AER HUB MM2 Coin Auto Farm - standalone script
+    Core coin-farming algorithms are extracted from the user-provided pulsehub.txt.
+    Standalone runtime + lightweight custom UI. FarmState/FarmMotion are from the supplied Pulse Hub source.
+    Adds role-aware full-bag actions (standalone fling/shoot/knife attempts), respawn, murderer-aware coin selection, and collision restoration.
+
+    Method: Under Map only; character farms lying on its side beneath the map. Sheriff now searches for a nearby grounded position with clear line of sight before firing.
+    V8SE compatibility/performance pass:
+    - throttled collision maintenance instead of a full character scan every frame;
+    - responsive UI scaling for smaller emulator windows;
+    - throttled coin-event UI refreshes;
+    - safe cleanup of a previous AER HUB UI instance.
+    Core farming/role algorithms and their decision logic are intentionally unchanged.
+
+    Requires a Roblox executor with the APIs used by the original script.
+    LDPlayer is only an Android emulator; it does not provide executor APIs by itself.
+]]
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local HttpService = game:GetService("HttpService")
+local LocalPlayer = Players.LocalPlayer
+
+-- Anti AFK: always enabled (logic adapted from the user's Pulse Hub source).
+-- It responds to Roblox's Idled event and attempts a harmless right-click input.
+local AntiAFKVirtualUser
+pcall(function()
+    AntiAFKVirtualUser = game:GetService("VirtualUser")
+end)
+
+if AntiAFKVirtualUser then
+    LocalPlayer.Idled:Connect(function()
+        pcall(function()
+            AntiAFKVirtualUser:CaptureController()
+            AntiAFKVirtualUser:ClickButton2(Vector2.new())
+        end)
+    end)
+end
+local Workspace = game:GetService("Workspace")
+local GlobalEnv = (type(getgenv) == "function" and getgenv()) or _G
+
+local environment = {
+    game = game,
+    workspace = Workspace,
+    Instance = Instance,
+    Vector3 = Vector3,
+    CFrame = CFrame,
+    Enum = Enum,
+    RaycastParams = RaycastParams,
+    OverlapParams = OverlapParams,
+    CollectionService = CollectionService,
+    task = task,
+    os = os,
+    math = math,
+    table = table,
+    tick = tick,
+    getgenv = function() return GlobalEnv end,
+    firetouchinterest = firetouchinterest,
+    isfile = isfile,
+    readfile = readfile,
+    writefile = writefile,
+    makefolder = makefolder,
+    isfolder = isfolder,
+}
+
+local context = {
+    environment = environment,
+    workspace = Workspace,
+    collection = CollectionService,
+    players = Players,
+    player = LocalPlayer,
+    runService = RunService,
+    storage = game:GetService("ReplicatedStorage"),
+    http = HttpService,
+    configuration = {farm = {speed = 23, fastSpeed = 23, tpSpeed = 23, method = "Under Map"}},
+    isAlive = function() return true end,
+}
+
+local FarmState = {}
+local FARM_ROLES = {Zombie = true, Survivor = true, Vampire = true, Hunter = true, Villager = true, Freezer = true, Runner = true}
+local FARM_OPTIONS = {"respawnOnFull", "antiFling", "avoidMurder", "autoFling", "killAura", "pickGun", "shootOnFull", "resetAfterRoleAction"}
+
+function FarmState.create(context)
+	local state = {enabled = false, round = false, active = false, session = 0, total = 0, rate = 0,
+		respawnOnFull = false, antiFling = false, avoidMurder = true, autoFling = true, killAura = true,
+		pickGun = true, shootOnFull = true, collected = {}, full = {}, skipped = {}, containers = {}, containersAt = 0,
+		bagItems = {}, bagAt = 0, coinsStarted = 0, knownRound = false, forcedFull = false}
+	local environment = context.environment
+	pcall(function()
+		if not environment.isfile or not environment.readfile or not environment.isfile("PulseFarmMM2_config.json") then return end
+		local saved = context.http:JSONDecode(environment.readfile("PulseFarmMM2_config.json"))
+		if type(saved) ~= "table" then return end
+		for _, key in FARM_OPTIONS do if type(saved[key]) == "boolean" then state[key] = saved[key] end end
+		if type(saved.totalCoins) == "number" then state.total = saved.totalCoins end
+	end)
+	return state
+end
+
+function FarmState.save(context, state)
+	if type(context.environment.writefile) ~= "function" then return end
+	pcall(function()
+		local saved = {totalCoins = state.total}
+		for _, key in FARM_OPTIONS do saved[key] = state[key] end
+		context.environment.writefile("PulseFarmMM2_config.json", context.http:JSONEncode(saved))
+	end)
+end
+
+function FarmState.roundStart(state, now, coinsStarted)
+	state.round, state.skipped = true, {}
+	if not coinsStarted then state.collected = {} end
+	table.clear(state.full)
+	state.forcedFull, state.coinsStarted, state.knownRound = false, coinsStarted and now or 0, true
+	if not coinsStarted then state.active = false end
+end
+
+function FarmState.roundEnd(state)
+	state.round, state.active, state.collected, state.forcedFull, state.coinsStarted = false, false, {}, false, 0
+end
+
+function FarmState.coinCollected(state, now, kind, count, maximum)
+	if state.coinsStarted == 0 then state.coinsStarted = now end
+	if type(kind) == "string" and type(count) == "number" and type(maximum) == "number" then state.full[kind] = count >= maximum end
+	local name = type(kind) == "string" and kind or "Coin"
+	local previous = state.collected[name] or 0
+	if not state.knownRound and state.collected[name] == nil and type(count) == "number" and count > 1 then previous = count - 1 end
+	local added = 1
+	if type(count) == "number" then
+		added = count >= previous and count - previous or count
+		state.collected[name] = count
+	end
+	if added > 0 then state.session, state.total, state.dirty = state.session + added, state.total + added, true end
+	return added
+end
+
+function FarmState.refreshBag(context, state)
+	local gui = context.player:FindFirstChild("PlayerGui")
+	local main = gui and gui:FindFirstChild("MainGUI")
+	local game = main and main:FindFirstChild("Game")
+	state.bag, state.bagItems = game and game:FindFirstChild("CoinBags") or nil, {}
+	if not state.bag then return end
+	for _, item in state.bag:GetDescendants() do
+		if item.Name == "Full" and item:IsA("GuiObject") and not item:FindFirstAncestorWhichIsA("LuaSourceContainer") then
+			table.insert(state.bagItems, item)
+		end
+	end
+end
+
+function FarmState.isFull(context, state, now)
+	if state.forcedFull then return true end
+	if state.coinsStarted == 0 then return false end
+	local any, all = false, true
+	for _, full in state.full do any = true; if not full then all = false end end
+	if any and all then return true end
+	if now - state.coinsStarted < 2 then return false end
+	if not state.bag or not state.bag.Parent or now - state.bagAt > 2 then
+		state.bagAt = now
+		FarmState.refreshBag(context, state)
+	end
+	if not state.bag or not state.bag.Visible then return false end
+	for _, item in state.bagItems do if item.Parent and item.Visible then return true end end
+	return false
+end
+
+function FarmState.validCoin(context, state, coin)
+	if not coin or not coin.Parent or not coin:IsA("BasePart") then return false end
+	if not coin:FindFirstChild("TouchInterest") or coin:GetAttribute("Collected") or state.skipped[coin] then return false end
+	local id = coin:GetAttribute("CoinID")
+	if id ~= nil and state.full[id] then return false end
+	return true
+end
+
+function FarmState.containers(context, state, now)
+	if now - state.containersAt < 0.5 then return state.containers end
+	state.containersAt = now
+	local containers, seen = {}, {}
+	for _, object in context.workspace:GetChildren() do
+		local container = object:FindFirstChild("CoinContainer")
+		if container and not seen[container] then seen[container] = true; table.insert(containers, container) end
+	end
+	for _, coin in context.collection:GetTagged("ServerCoinPart") do
+		local container = coin.Parent
+		if container and not seen[container] and container ~= context.workspace and container:IsDescendantOf(context.workspace) then
+			seen[container] = true
+			table.insert(containers, container)
+		end
+	end
+	state.containers = containers
+	return containers
+end
+
+function FarmState.canFarm(context, state, roles)
+	if type(roles) ~= "table" then return false end
+	local role = roles[context.player.Name]
+	if not role or not role.Role then return false end
+	if role.Dead ~= true and role.Killed ~= true then return true end
+	local character = context.player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	return FARM_ROLES[tostring(role.Role)] == true and humanoid ~= nil and humanoid.Health > 0
+end
+
+
+local FarmMotion = {}
+
+function FarmMotion.create()
+	return {phase = "idle", gotT = 0, learn = {}, tries = 0, got = 0, fails = 0, info = {}, skip = {}, pending = {},
+		att = {}, gapT = 4.5, tp = {}, containerAt = 0, containers = {}, filterAt = 0}
+end
+
+function FarmMotion.parts(character)
+	local parts = {}
+	if not character then return parts end
+	local head = character:FindFirstChild("Head")
+	if head then table.insert(parts, head) end
+	for _, child in character:GetChildren() do
+		if not child:IsA("Accessory") then continue end
+		local handle = child:FindFirstChild("Handle")
+		if handle then table.insert(parts, handle) end
+	end
+	for _, name in {"UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso"} do
+		local part = character:FindFirstChild(name)
+		if part then table.insert(parts, part) end
+	end
+	return parts
+end
+
+function FarmMotion.touch(context, character, coin)
+	local environment = context.environment
+	if type(environment.firetouchinterest) ~= "function" or not character or not coin or not coin.Parent then return end
+	for _, part in FarmMotion.parts(character) do
+		pcall(function() environment.firetouchinterest(part, coin, 0); environment.firetouchinterest(part, coin, 1) end)
+	end
+end
+
+function FarmMotion.containers(context, state, motion, now)
+	if now - motion.containerAt > 1 then
+		motion.containerAt = now
+		motion.containers = FarmState.containers(context, state, now)
+	end
+	return motion.containers
+end
+
+function FarmMotion.rayParams(context, state, motion, now)
+	if not motion.rayParams then
+		motion.rayParams = context.environment.RaycastParams.new()
+		motion.rayParams.FilterType = context.environment.Enum.RaycastFilterType.Exclude
+		pcall(function() motion.rayParams.RespectCanCollide = true end)
+	end
+	if now - motion.filterAt > 1 then
+		motion.filterAt = now
+		local ignored = {}
+		for _, player in context.players:GetPlayers() do if player.Character then table.insert(ignored, player.Character) end end
+		for _, container in FarmMotion.containers(context, state, motion, now) do table.insert(ignored, container) end
+		motion.rayParams.FilterDescendantsInstances = ignored
+	end
+	return motion.rayParams
+end
+
+function FarmMotion.floor(context, state, motion, position, offset, depth, now)
+	local vector = context.environment.Vector3
+	local hit = context.workspace:Raycast(position + vector.new(0, offset or 0.5, 0), vector.new(0, -(depth or 50), 0),
+		FarmMotion.rayParams(context, state, motion, now))
+	return hit and hit.Position.Y or nil
+end
+
+function FarmMotion.coinInfo(context, state, motion, coin, now)
+	if motion.info[coin] then return motion.info[coin] end
+	local position = coin.Position
+	local surface = FarmMotion.floor(context, state, motion, position, 0.5, 40, now) or position.Y - 3
+	local hide = context.environment.Vector3.new(position.X, surface - 3.8, position.Z)
+	local info = {surf = surface, hide = hide, exposed = FarmMotion.floor(context, state, motion, hide, 0, 7, now) ~= nil}
+	motion.info[coin] = info
+	return info
+end
+
+function FarmMotion.murderPenalty(state, position, murderer)
+	if not murderer then return 0 end
+	local distance = (position - murderer).Magnitude
+	if distance < 24 then return state.avoidMurder and 1000000 or 300 end
+	if distance < 48 then return (48 - distance) * 2 end
+	return 0
+end
+
+function FarmMotion.choose(context, state, motion, position, murderer, now)
+	local chosen, lowest
+	for _, container in FarmMotion.containers(context, state, motion, now) do
+		if not container.Parent then continue end
+		for _, coin in container:GetChildren() do
+			if not FarmState.validCoin(context, state, coin) or (motion.skip[coin] or 0) >= now or motion.pending[coin] then continue end
+			local info = FarmMotion.coinInfo(context, state, motion, coin, now)
+			local score = (info.hide - position).Magnitude + math.max(0, coin.Position.Y - info.hide.Y) * 1.2
+			if info.exposed then score += 25 end
+			score += FarmMotion.murderPenalty(state, coin.Position, murderer)
+			if not lowest or score < lowest then chosen, lowest = coin, score end
+		end
+	end
+	if chosen and state.avoidMurder and lowest >= 1000000 then return nil end
+	return chosen, lowest
+end
+
+function FarmMotion.jump(context, motion, root, destination, forced, now)
+	if not forced and (destination - root.Position).Magnitude <= 1000 then return false end
+	root.CFrame = context.environment.CFrame.new(destination)
+	root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = context.environment.Vector3.zero, context.environment.Vector3.zero
+	motion.goT, motion.jumps = now, (motion.jumps or 0) + 1
+	return true
+end
+
+function FarmMotion.hideAt(context, state, motion, root, now)
+	local floor = FarmMotion.floor(context, state, motion, root.Position, 9, 30, now)
+	if not floor then return root.Position end
+	local position = root.Position
+	return context.environment.Vector3.new(position.X, math.min(position.Y, floor - 3.8), position.Z)
+end
+
+function FarmMotion.canShootAt(context, position, root)
+	local environment, workspace = context.environment, context.workspace
+	local character = root.Parent
+	local head = character and character:FindFirstChild("Head")
+	if not head then return true end
+	local attachment = root:FindFirstChild("GunRaycastAttachment")
+	local ray = environment.RaycastParams.new()
+	ray.FilterType, ray.FilterDescendantsInstances = environment.Enum.RaycastFilterType.Exclude, {character}
+	if not attachment then
+		local overlap = environment.OverlapParams.new()
+		overlap.FilterType, overlap.FilterDescendantsInstances = environment.Enum.RaycastFilterType.Exclude, {character}
+		return #workspace:GetPartBoundsInBox(environment.CFrame.new(position + environment.Vector3.new(0, 1, 0)),
+			environment.Vector3.new(5, 4.5, 5), overlap) == 0
+	end
+	local vector, frame = environment.Vector3, environment.CFrame
+	local headLocal, muzzle = root.CFrame:PointToObjectSpace(head.Position), attachment.CFrame
+	local offsets = {vector.zero, vector.new(0.2, 0, 0), vector.new(-0.2, 0, 0), vector.new(0, 0.2, 0), vector.new(0, -0.2, 0)}
+	local function clear(pose)
+		local endpoint = (pose * muzzle).Position
+		for _, offset in offsets do
+			local origin = pose * (headLocal + offset)
+			local direction = endpoint - origin
+			if direction.Magnitude > 0.001 and workspace:Raycast(origin, direction * ((direction.Magnitude + 0.6) / direction.Magnitude), ray) then return false end
+		end
+		return true
+	end
+	for index = 0, 7 do
+		local pose = frame.new(position) * frame.Angles(0, index * math.pi / 4, 0)
+		if clear(pose) and clear(pose * frame.Angles(0, math.rad(25), 0)) and clear(pose * frame.Angles(0, -math.rad(25), 0)) then return true end
+	end
+	return false
+end
+
+function FarmMotion.findShootSpot(context, root, position, startDepth)
+	local vector = context.environment.Vector3
+	local minimum = context.workspace.FallenPartsDestroyHeight + 25
+	local depth = startDepth or 0
+	for offset = depth, depth + 48, 2 do
+		local candidate = position - vector.new(0, offset, 0)
+		if candidate.Y < minimum then break end
+		if FarmMotion.canShootAt(context, candidate, root) then return candidate, offset end
+	end
+	return position - vector.new(0, depth, 0), depth
+end
+
+function FarmMotion.shootSpot(context, state, motion, root, now)
+	local spot = motion.spot
+	local vector = context.environment.Vector3
+	if not spot or vector.new(spot.X - root.Position.X, 0, spot.Z - root.Position.Z).Magnitude > 10 then
+		motion.spotBase = FarmMotion.hideAt(context, state, motion, root, now)
+		motion.spot, motion.spotD = FarmMotion.findShootSpot(context, root, motion.spotBase, 0)
+		motion.spotT = now
+		return motion.spot
+	end
+	if (spot - root.Position).Magnitude < 1 and now - (motion.spotT or 0) > 1 then
+		motion.spotT = now
+	end
+	return motion.spot
+end
+
+function FarmMotion.skip(context, state, coin)
+	state.skipped[coin] = true
+	context.environment.task.delay(30, function() state.skipped[coin] = nil end)
+end
+
+function FarmMotion.underMap(context, state, motion, options)
+	local now, root, velocity, gyro, character = options.time, options.root, options.velocity, options.gyro, options.character
+	local murderer, gun = options.murderer, options.gun
+	local speed = math.clamp(tonumber(context.configuration.farm.speed) or 23, 20, 25)
+	local coin = motion.coin
+	if gun then coin = gun end
+	if not gun then
+		if coin and not FarmState.validCoin(context, state, coin) then
+			if motion.phase == "rise" and motion.riseFrom then
+				table.insert(motion.learn, coin.Position.Y - root.Position.Y)
+				if #motion.learn > 60 then table.remove(motion.learn, 1) end
+			end
+			motion.got, motion.coin, motion.phase, coin = motion.got + 1, nil, "go", nil
+		end
+		if not coin or motion.phase == "go" and now - (motion.pickT or 0) > 0.3 then
+			motion.pickT = now
+			local candidate, score = FarmMotion.choose(context, state, motion, root.Position, murderer, now)
+			if candidate and candidate ~= coin then
+				local current
+				if coin and FarmState.validCoin(context, state, coin) then
+					local info = FarmMotion.coinInfo(context, state, motion, coin, now)
+					current = (info.hide - root.Position).Magnitude + math.max(0, coin.Position.Y - info.hide.Y) * 1.2
+						+ (info.exposed and 25 or 0) + FarmMotion.murderPenalty(state, coin.Position, murderer)
+				end
+				if not current or score + 6 < current then
+					motion.coin, motion.phase, motion.goT, motion.tries, coin = candidate, "go", now, motion.tries + 1, candidate
+				end
+			end
+		end
+	end
+	if not coin then
+		FarmMotion.move(context, root, velocity, gyro, FarmMotion.hideAt(context, state, motion, root, now), options.delta, speed)
+		motion.phase = "wait"
+		return
+	end
+	local info = FarmMotion.coinInfo(context, state, motion, coin, now)
+	if motion.phase ~= "rise" then
+		if motion.phase ~= "go" then motion.phase, motion.goT = "go", now end
+		local force = state.firstJump and coin ~= gun
+		if force then state.firstJump = false end
+		FarmMotion.jump(context, motion, root, info.hide, force, now)
+		local distance = FarmMotion.move(context, root, velocity, gyro, info.hide, options.delta, speed)
+		if distance < 0.7 then motion.phase, motion.riseFrom, motion.dwellFrom = "rise", now, nil; return end
+		if now - (motion.goT or now) > distance / math.max(speed, 1) + 4 then
+			FarmMotion.skip(context, state, coin)
+			motion.coin, motion.gunTarget, motion.fails, motion.phase = nil, nil, motion.fails + 1, "go"
+		end
+		return
+	end
+	if murderer and coin ~= gun then
+		local distance = context.environment.Vector3.new(coin.Position.X - murderer.X, 0, coin.Position.Z - murderer.Z).Magnitude
+		if distance < 12 then motion.skip[coin], motion.coin, motion.phase = now + 3, nil, "go"; return end
+	end
+	local attempts = motion.att[coin] or 0
+	local gap = math.max(0.6, motion.gapT - 0.45 * attempts)
+	local destination = context.environment.Vector3.new(info.hide.X, math.max(coin.Position.Y - gap, info.hide.Y), info.hide.Z)
+	local distance = FarmMotion.move(context, root, velocity, gyro, destination, options.delta, speed)
+	if now - (motion.touchAt or 0) >= 1 / 30 then motion.touchAt = now; FarmMotion.touch(context, character, coin) end
+	if distance < 0.3 then
+		motion.dwellFrom = motion.dwellFrom or now
+		if now - motion.dwellFrom >= 0.1 + (coin == gun and 0.25 or 0) then
+			motion.att[coin] = attempts + 1
+			if attempts + 1 >= 4 then FarmMotion.skip(context, state, coin); motion.fails += 1 end
+			if attempts + 1 < 4 then motion.pending[coin] = {t = now + 0.9, gap = gap} end
+			if coin == gun then motion.gunTarget = nil end
+			motion.coin, motion.dwellFrom, motion.phase = nil, nil, "go"
+			return
+		end
+	end
+	if now - (motion.riseFrom or now) > 1.4 then
+		FarmMotion.skip(context, state, coin)
+		if coin == gun then motion.gunTarget = nil end
+		motion.coin, motion.fails, motion.phase = nil, motion.fails + 1, "go"
+	end
+end
+
+function FarmMotion.fast(context, state, motion, options)
+	local now, root, velocity, gyro, character = options.time, options.root, options.velocity, options.gyro, options.character
+	local gun, murderer = options.gun, options.murderer
+	local speed = math.clamp(tonumber(context.configuration.farm.fastSpeed) or 25, 8, 25)
+	local coin = motion.coin
+	if coin and coin ~= gun and (not FarmState.validCoin(context, state, coin) or motion.pending[coin]) then
+		if not FarmState.validCoin(context, state, coin) then motion.got += 1 end
+		motion.coin, coin = nil, nil
+	end
+	local target = gun
+	if not target then
+		if not coin or now - (motion.pickT or 0) > 0.3 then
+			motion.pickT = now
+			local best, lowest
+			for _, container in FarmMotion.containers(context, state, motion, now) do
+				if not container.Parent then continue end
+				for _, candidate in container:GetChildren() do
+					if not FarmState.validCoin(context, state, candidate) or (motion.skip[candidate] or 0) >= now or motion.pending[candidate] then continue end
+					local score = (candidate.Position - root.Position).Magnitude + FarmMotion.murderPenalty(state, candidate.Position, murderer)
+					if not lowest or score < lowest then best, lowest = candidate, score end
+				end
+			end
+			if best and state.avoidMurder and lowest >= 1000000 then best = nil end
+			if best and best ~= coin and (not coin or lowest + 6 < (coin.Position - root.Position).Magnitude + FarmMotion.murderPenalty(state, coin.Position, murderer)) then
+				motion.coin, motion.goT, motion.tries, coin = best, now, motion.tries + 1, best
+			end
+		end
+		target = coin
+	end
+	if not target then velocity.Velocity, motion.phase = context.environment.Vector3.zero, "wait"; return end
+	motion.phase = "go"
+	local force = state.firstJump and target ~= gun
+	if force then state.firstJump = false end
+	FarmMotion.jump(context, motion, root, target.Position, force, now)
+	local distance = FarmMotion.move(context, root, velocity, gyro, target.Position, options.delta, speed)
+	if distance < 4 then FarmMotion.touch(context, character, target) end
+	if distance < 1 then
+		motion.dwellFrom = motion.dwellFrom or now
+		if now - motion.dwellFrom >= (target == gun and 0.25 or 0.05) then
+			if target == gun then motion.gunTarget = nil end
+			if target ~= gun then motion.pending[target] = {t = now + 0.9} end
+			motion.coin, motion.dwellFrom = nil, nil
+		end
+		return
+	end
+	motion.dwellFrom = nil
+	if now - (motion.goT or now) > distance / speed + 4 then
+		FarmMotion.skip(context, state, target)
+		if target == gun then motion.gunTarget = nil end
+		motion.coin, motion.fails = nil, motion.fails + 1
+	end
+end
+
+function FarmMotion.setTouch(context, state, motion, target, now)
+	local teleport = motion.tp
+	teleport.ct = teleport.ct or {}
+	for coin in teleport.ct do
+		if coin ~= target and coin.Parent then continue end
+		if coin.Parent then pcall(function() coin.CanTouch = true end) end
+		teleport.ct[coin] = nil
+	end
+	for _, container in FarmMotion.containers(context, state, motion, now) do
+		if not container.Parent then continue end
+		for _, coin in container:GetChildren() do
+			if coin == target or teleport.ct[coin] or not coin:IsA("BasePart") or not coin.CanTouch or not coin:FindFirstChild("TouchInterest") then continue end
+			teleport.ct[coin] = true
+			pcall(function() coin.CanTouch = false end)
+		end
+	end
+end
+
+function FarmMotion.restoreTouch(motion)
+	local teleport = motion.tp
+	if not teleport or not teleport.ct then return end
+	for coin in teleport.ct do
+		if coin.Parent and not coin:GetAttribute("Collected") then pcall(function() coin.CanTouch = true end) end
+	end
+	teleport.ct = nil
+end
+
+function FarmMotion.teleportPick(context, state, motion, now, murderer, previous, current)
+	local coins, teleport = {}, motion.tp
+	for _, container in FarmMotion.containers(context, state, motion, now) do
+		if not container.Parent then continue end
+		for _, coin in container:GetChildren() do
+			if not FarmState.validCoin(context, state, coin) or (motion.skip[coin] or 0) >= now then continue end
+			table.insert(coins, coin)
+			teleport.valid = teleport.valid or setmetatable({}, {__mode = "k"})
+			teleport.valid[coin] = true
+		end
+	end
+	if #coins == 0 then return nil end
+	if previous and (coins[1].Position - previous).Magnitude > 1000 then previous = nil end
+	local best, lowest, currentScore
+	for _, coin in coins do
+		local nearest, second, third = math.huge, math.huge, math.huge
+		for _, other in coins do
+			if other == coin then continue end
+			local distance = (other.Position - coin.Position).Magnitude
+			if distance < nearest then nearest, second, third = distance, nearest, second; continue end
+			if distance < second then second, third = distance, second; continue end
+			if distance < third then third = distance end
+		end
+		local score = previous and ((coin.Position - previous).Magnitude + 0.25 * (math.min(nearest, 120) + math.min(second, 120)))
+			or math.min(nearest, 300) + math.min(second, 300) + math.min(third, 300)
+		score += FarmMotion.murderPenalty(state, coin.Position, murderer)
+		if coin == current then currentScore = score end
+		if not lowest or score < lowest then best, lowest = coin, score end
+	end
+	if best and state.avoidMurder and lowest >= 1000000 then return nil end
+	return best, lowest, currentScore
+end
+
+function FarmMotion.home(context, motion, now)
+	if motion.homeCF and now - (motion.homeAt or 0) < 5 then return motion.homeCF end
+	motion.homeAt, motion.homeCF = now, nil
+	local lobby = context.workspace:FindFirstChild("Lobby")
+	local spawns = lobby and lobby:FindFirstChild("Spawns")
+	if not spawns then return nil end
+	local total, count = context.environment.Vector3.zero, 0
+	for _, part in spawns:GetDescendants() do
+		if part:IsA("BasePart") then total, count = total + part.Position, count + 1 end
+	end
+	if count > 0 then motion.homeCF = context.environment.CFrame.new(total / count + context.environment.Vector3.new(0, 4, 0)) end
+	return motion.homeCF
+end
+
+function FarmMotion.teleportReference(context, state, motion, root, now, tickTime)
+	local teleport = motion.tp
+	if teleport.lastAt == nil then
+		teleport.lastAt = motion.evAt or 0
+		if motion.evAt and now - motion.evAt < 20 then teleport.lastPos = motion.evPos end
+		teleport.seenEv = motion.evAt or 0
+		if not motion.evAt and state.coinsStarted > 0 and tickTime - state.coinsStarted > 5 then teleport.cold = now + 2.5 end
+	end
+	local event = motion.evAt
+	if not event or event <= (teleport.seenEv or 0) then return end
+	teleport.seenEv = event
+	if event <= teleport.lastAt then return end
+	teleport.lastAt = event
+	if teleport.touchC and event - (teleport.touchT or 0) < 1.5 then teleport.lastPos = teleport.touchC.Position; return end
+	local position, nearest, selected = root and root.Position, nil, nil
+	for coin in teleport.valid or {} do
+		if not coin.Parent or not coin:GetAttribute("Collected") or not position then continue end
+		local distance = (coin.Position - position).Magnitude
+		if distance < 14 and (not nearest or distance < nearest) then nearest, selected = distance, coin end
+	end
+	if selected then teleport.lastPos = selected.Position; return end
+	teleport.lastPos, teleport.cold = nil, event + 3
+end
+
+function FarmMotion.teleport(context, state, motion, options)
+	local now, root, velocity, character, gun = options.time, options.root, options.velocity, options.character, options.gun
+	local teleport = motion.tp
+	local home = FarmMotion.home(context, motion, now) or teleport.start
+	teleport.start = teleport.start or root.CFrame
+	velocity.Velocity = context.environment.Vector3.zero
+	FarmMotion.teleportReference(context, state, motion, root, now, options.tickTime)
+	local function returnHome(phase, force)
+		motion.phase = phase
+		if home and (force or (root.Position - home.Position).Magnitude > 6) then root.CFrame = home end
+		root.AssemblyLinearVelocity = context.environment.Vector3.zero
+	end
+	if teleport.cold and not gun and now < teleport.cold then returnHome("wait"); return end
+	local coin = teleport.coin
+	if coin then
+		local isGun = coin == gun
+		local collected = isGun and (coin.Parent == nil or options.hasGun) or not isGun and not FarmState.validCoin(context, state, coin)
+		local done = false
+		if collected then
+			if isGun then motion.gunTarget = nil end
+			if not isGun and coin:GetAttribute("Collected") then motion.got += 1 end
+			if not isGun and teleport.touching then
+				if now > teleport.lastAt then teleport.lastAt = now end
+				teleport.lastPos = coin.Position
+				local latency = now - (teleport.at or now)
+				if latency > 0 and latency < 0.6 then motion.tpLat = math.clamp((motion.tpLat or 0.1) * 0.8 + latency * 0.2, 0.03, 0.3) end
+			end
+			done = true
+		end
+		if not collected then
+			if teleport.touching and now - teleport.at > 0.9 then
+				FarmMotion.skip(context, state, coin)
+				motion.fails += 1
+				if isGun then motion.gunTarget = nil end
+				done = true
+			end
+			if gun and not isGun then done = true end
+		end
+		if done then teleport.coin, teleport.touching = nil, false; returnHome("home", true); return end
+	end
+	if options.full and not gun then returnHome("full"); return end
+	if not teleport.coin then
+		local target = gun or FarmMotion.teleportPick(context, state, motion, now, options.murderer, teleport.lastPos)
+		if not target then returnHome("home"); return end
+		teleport.coin, teleport.touching, teleport.at = target, false, now
+		teleport.hide = target == gun and target.Position or FarmMotion.coinInfo(context, state, motion, target, now).hide
+		motion.tries += 1
+		FarmMotion.setTouch(context, state, motion, target, now)
+		teleport.ctAt = now
+	end
+	coin = teleport.coin
+	if now - (teleport.ctAt or 0) > 0.1 then
+		teleport.ctAt = now
+		FarmMotion.setTouch(context, state, motion, coin, now)
+	end
+	local isGun = coin == gun
+	if not isGun and not teleport.touching and now - (teleport.rpAt or 0) > 0.2 then
+		teleport.rpAt = now
+		local target, score, currentScore = FarmMotion.teleportPick(context, state, motion, now, options.murderer, teleport.lastPos, coin)
+		if target and target ~= coin and (not currentScore or score + 2 < currentScore) then
+			coin, teleport.coin, teleport.at = target, target, now
+			teleport.hide = FarmMotion.coinInfo(context, state, motion, target, now).hide
+			FarmMotion.setTouch(context, state, motion, target, now)
+			teleport.ctAt = now
+		end
+	end
+	local arrival = now
+	if not isGun and teleport.lastPos and (coin.Position - teleport.lastPos).Magnitude < 1000 then
+		local speed = math.clamp(tonumber(context.configuration.farm.tpSpeed) or 25, 10, 26)
+		arrival = math.max(teleport.lastAt, teleport.lastAt + (coin.Position - teleport.lastPos).Magnitude / speed - 0.4 * (motion.tpLat or 0.1))
+	end
+	if not teleport.touching and now < arrival - 0.35 then returnHome("wait"); return end
+	root.CFrame = context.environment.CFrame.new(teleport.hide)
+	root.AssemblyLinearVelocity = context.environment.Vector3.zero
+	if teleport.touching or now >= arrival then
+		if not teleport.touching then teleport.touching, teleport.at = true, now end
+		teleport.touchC, teleport.touchT = coin, now
+		FarmMotion.touch(context, character, coin)
+		motion.phase = "tp"
+		return
+	end
+	motion.phase = "wait"
+end
+
+function FarmMotion.ensureMover(context, root, humanoid, withoutGyro)
+	local environment = context.environment
+	local velocity = root:FindFirstChild("PulseFarmBV")
+	if not velocity then
+		velocity = environment.Instance.new("BodyVelocity")
+		velocity.Name, velocity.MaxForce, velocity.P = "PulseFarmBV", environment.Vector3.new(9e9, 9e9, 9e9), 30000
+		velocity.Velocity = environment.Vector3.zero
+		velocity:SetAttribute("PulseMine", true)
+		velocity.Parent = root
+	end
+	local gyro = root:FindFirstChild("PulseFarmBG")
+	if withoutGyro and gyro then pcall(function() gyro:Destroy() end); gyro = nil end
+	if not withoutGyro and not gyro then
+		gyro = environment.Instance.new("BodyGyro")
+		gyro.Name, gyro.MaxTorque, gyro.P = "PulseFarmBG", environment.Vector3.new(0, 9e9, 0), 30000
+		gyro:SetAttribute("PulseMine", true)
+		gyro.CFrame = environment.CFrame.lookAt(root.Position, root.Position + environment.Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z + 1e-4))
+		gyro.Parent = root
+	end
+	if humanoid and not humanoid.PlatformStand then pcall(function() humanoid.PlatformStand = true end) end
+	return velocity, gyro
+end
+
+function FarmMotion.move(context, root, velocity, gyro, destination, delta, speed)
+	local direction = destination - root.Position
+	local distance = direction.Magnitude
+	velocity.Velocity = distance < 0.05 and context.environment.Vector3.zero or direction.Unit * math.min(speed, distance / math.max(delta, 1 / 60))
+	local horizontal = context.environment.Vector3.new(direction.X, 0, direction.Z)
+	if gyro and horizontal.Magnitude > 0.4 then gyro.CFrame = context.environment.CFrame.lookAt(root.Position, root.Position + horizontal.Unit) end
+	-- Keep the avatar visibly lying on its side while the Under Map route moves it.
+	local look = horizontal.Magnitude > 0.4 and horizontal.Unit or root.CFrame.LookVector
+	local flatLook = context.environment.Vector3.new(look.X, 0, look.Z)
+	if flatLook.Magnitude > 0.01 then
+		pcall(function()
+			root.CFrame = context.environment.CFrame.lookAt(root.Position, root.Position + flatLook.Unit)
+				* context.environment.CFrame.Angles(0, 0, math.rad(90))
+		end)
+	end
+	return distance
+end
+
+function FarmMotion.reset(context, motion, character)
+	pcall(function()
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if root then
+			for _, name in {"PulseFarmBV", "PulseFarmBG"} do local object = root:FindFirstChild(name); if object then object:Destroy() end end
+		end
+		if humanoid and humanoid.PlatformStand then
+			humanoid.PlatformStand = false
+			if humanoid.Health > 0 then humanoid:ChangeState(context.environment.Enum.HumanoidStateType.GettingUp) end
+		end
+	end)
+	if motion.ctRestore then pcall(motion.ctRestore) end
+	motion.phase, motion.coin, motion.hold = "idle", nil, nil
+end
+
+function FarmMotion.updatePending(context, state, motion, now)
+	for coin, entry in motion.pending do
+		if type(entry) ~= "table" then continue end
+		if FarmState.validCoin(context, state, coin) then
+			if now > entry.t then
+				motion.pending[coin] = nil
+				motion.gapT, motion.miss = math.max(1, motion.gapT - 0.25), (motion.miss or 0) + 1
+			end
+			continue
+		end
+		motion.pending[coin] = nil
+		motion.gapT, motion.ok = math.min(6, motion.gapT + 0.08), (motion.ok or 0) + 1
+	end
+end
+
+
+local FlingFeature = {}
+
+local function aerFlingDown(context, state, target, duration, options)
+	options = options or {}
+	if state.busy then return false, "busy" end
+	if not target or not target.Parent then return false, "no-target" end
+	local targetHumanoid = target:FindFirstChildOfClass("Humanoid")
+	local targetRoot = target:FindFirstChild("HumanoidRootPart") or target:FindFirstChild("Head")
+	if not targetHumanoid or not targetRoot or targetHumanoid.Health <= 0 then return false, "dead" end
+	local character = context.player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not root or humanoid.Health <= 0 then return false, "me" end
+	local environment, workspace, run = context.environment, context.workspace, context.runService
+	local vector, frame = environment.Vector3, environment.CFrame
+	local now = environment.os.clock
+	state.busy = true
+	duration = tonumber(duration) or 0.8
+	if state.fpdh == nil then state.fpdh = workspace.FallenPartsDestroyHeight end
+	local home, camera = options.home or root.CFrame, workspace.CurrentCamera
+	local subject, seated, platform = camera and camera.CameraSubject, true, false
+	pcall(function() seated = humanoid:GetStateEnabled(environment.Enum.HumanoidStateType.Seated) end)
+	pcall(function() platform = humanoid.PlatformStand end)
+	pcall(function() workspace.FallenPartsDestroyHeight = 0 / 0 end)
+	pcall(function() humanoid:SetStateEnabled(environment.Enum.HumanoidStateType.Seated, false) end)
+	if options.cam ~= false then pcall(function() if camera then camera.CameraSubject = targetHumanoid end end) end
+	local parts = {}
+	pcall(function()
+		for _, part in target:GetDescendants() do if part:IsA("BasePart") then table.insert(parts, {part, part.CanCollide}) end end
+	end)
+	local function disableCollision()
+		for _, entry in parts do
+			local part = entry[1]
+			if part.Parent and part.CanCollide then pcall(function() part.CanCollide = false end) end
+		end
+	end
+	disableCollision()
+	local downward, startY = 120000, targetRoot.Position.Y
+	local pingOk, ping = pcall(function() return context.player:GetNetworkPing() end)
+	local lead = math.clamp(0.16 + (pingOk and tonumber(ping) or 0.08) * 2 + 0.05, 0.15, 0.6)
+	local speeds = {1.4, 0.5, 2.3, 0.9}
+	local moveOk, moving = pcall(function() return targetHumanoid.MoveDirection.Magnitude * targetHumanoid.WalkSpeed end)
+	local velocity, spoofCount = targetRoot.AssemblyLinearVelocity, 0
+	if velocity.Magnitude > 1500 then velocity, spoofCount = vector.zero, 1 end
+	local initialSpeed = vector.new(velocity.X, 0, velocity.Z).Magnitude
+	if moveOk and moving > 2 or initialSpeed > 3 or spoofCount > 0 then duration = math.max(duration, 1.2) end
+	local targetPlayer = context.players:GetPlayerFromCharacter(target)
+	local userId = targetPlayer and targetPlayer.UserId
+	state.leadMem = state.leadMem or {}
+	local multiplier = 1
+	local positions, candidates, offsets = {}, {}, {0, 0.3, 0.55, 0.8}
+	local started, frames, done, result, minimumVelocity, minimumY = now(), 0, false, "timeout", 0, startY
+	local lastTarget, teleported, lastSelf, firstPosition, filtered, filteredAt = targetRoot.Position, false, nil, nil, nil, nil
+	local predicted, predictedAt, teleportAt = nil, nil, nil
+	local params = environment.RaycastParams.new()
+	params.FilterType, params.FilterDescendantsInstances = environment.Enum.RaycastFilterType.Exclude, {character, target}
+	pcall(function() params.RespectCanCollide = true end)
+	local stepped = run.Stepped:Connect(function()
+		if done then return end
+		pcall(function() root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = vector.zero, vector.zero end)
+		disableCollision()
+	end)
+	local heartbeat = run.Heartbeat:Connect(function()
+		if done then return end
+		frames += 1
+		if not target.Parent or not targetRoot.Parent or targetHumanoid.Health <= 0 then done, result = true, "gone"; return end
+		if not root.Parent or humanoid.Health <= 0 then done, result = true, "me"; return end
+		local position, actualVelocity, time = targetRoot.Position, targetRoot.AssemblyLinearVelocity, now()
+		if actualVelocity.Magnitude > 1500 then spoofCount += 1 end
+		local observed
+		if (position - lastTarget).Magnitude > 60 then
+			if spoofCount == 0 then done, result = true, "tp-target"; return end
+			teleportAt = teleportAt or time
+			if time - teleportAt > 0.35 then
+				if position.Y < startY - 25 then done, result = true, "down"; return end
+				if (position - lastTarget).Magnitude > 300 then done, result = true, "tp-target"; return end
+				lastTarget, teleportAt, observed = position, nil, position
+			end
+			if not observed then observed = lastTarget end
+		end
+		if not observed then lastTarget, teleportAt, observed = position, nil, position end
+		table.insert(positions, {time, observed})
+		while #positions > 2 and time - positions[1][1] > 0.25 do table.remove(positions, 1) end
+		local measured = actualVelocity
+		if spoofCount > 0 then
+			local elapsed = time - positions[1][1]
+			measured = elapsed > 0.06 and (observed - positions[1][2]) / elapsed or vector.zero
+		end
+		if lastSelf and (root.Position - lastSelf).Magnitude > 30 then done, result, teleported = true, "tp-me", true; return end
+		minimumVelocity, minimumY = math.min(minimumVelocity, measured.Y), math.min(minimumY, observed.Y)
+		if observed.Y < startY - 25 then done, result = true, "down"; return end
+		if measured.Y < -250 then done, result = true, "falling"; return end
+		if now() - started > duration then done = true; return end
+		if firstPosition and (root.Position - firstPosition).Magnitude > 60 and (observed - firstPosition).Magnitude > 55 then done, result = true, "far"; return end
+		local horizontal = vector.new(measured.X, 0, measured.Z)
+		local movementOk, direction, speed = pcall(function() return targetHumanoid.MoveDirection, targetHumanoid.WalkSpeed end)
+		local movement = horizontal
+		if movementOk and direction and direction.Magnitude > 0.1 then
+			local desired = vector.new(direction.X, 0, direction.Z).Unit * math.clamp(tonumber(speed) or 16, 0, 60)
+			movement = horizontal.Magnitude > 40 and horizontal or desired:Lerp(horizontal, 0.25)
+		end
+		local movingNow = movement.Magnitude > 2
+		local timeNow, targetPosition, height = now(), observed, nil
+		if movingNow then
+			if filtered and filteredAt then
+				local limit = 30 * math.clamp(timeNow - filteredAt, 1 / 240, 0.05)
+				local delta = vector.new(observed.X - filtered.X, 0, observed.Z - filtered.Z)
+				if delta.Magnitude > limit then delta = delta.Unit * limit end
+				filtered = vector.new(filtered.X + delta.X, observed.Y, filtered.Z + delta.Z)
+			end
+			if not filtered then filtered = observed end
+			local cycle = frames % 8
+			multiplier = offsets[cycle % 4 + 1]
+			local delta = movement * multiplier
+			if delta.Magnitude > 25 then delta = delta.Unit * 25 end
+			if delta.Magnitude > 0.1 then
+				local ok, hit = pcall(function() return workspace:Raycast(filtered, delta, params) end)
+				if ok and hit then delta = delta.Unit * math.max(0, hit.Distance - 1.5) end
+			end
+			table.insert(candidates, {timeNow, multiplier})
+			while #candidates > 0 and timeNow - candidates[1][1] > 1.2 do table.remove(candidates, 1) end
+			targetPosition, height = filtered + delta, cycle < 4 and 1.4 or -0.6
+		end
+		if not movingNow then height = speeds[frames % #speeds + 1] end
+		pcall(function()
+			humanoid.PlatformStand = true
+			local position = vector.new(targetPosition.X, math.max(targetPosition.Y, startY - 3) + height, targetPosition.Z)
+			if predicted and predictedAt and not movingNow then
+				local limit = 20 * math.clamp(timeNow - predictedAt, 1 / 240, 0.05)
+				local delta = vector.new(position.X - predicted.X, 0, position.Z - predicted.Z)
+				if delta.Magnitude > limit then
+					local reduced = predicted + delta.Unit * limit
+					position = vector.new(reduced.X, position.Y, reduced.Z)
+				end
+			end
+			local grounded = workspace:Raycast(position, vector.new(0, -15, 0), params) ~= nil
+			if not grounded then
+				local fallback = vector.new(lastTarget.X, math.max(lastTarget.Y, startY - 3) + height, lastTarget.Z)
+				if (movingNow or not predicted or vector.new(fallback.X - predicted.X, 0, fallback.Z - predicted.Z).Magnitude
+					<= 20 * 0.05)
+					and workspace:Raycast(fallback, vector.new(0, -15, 0), params) then position, grounded = fallback, true end
+			end
+			if movingNow then
+				local direction = movement.Unit
+				root.CFrame = frame.lookAt(position, position + vector.new(-direction.Z, 0, direction.X))
+			end
+			if not movingNow then root.CFrame = frame.new(position) end
+			root.AssemblyAngularVelocity = vector.zero
+			if grounded and movingNow then
+				root.AssemblyLinearVelocity = vector.new(movement.X, -downward, movement.Z)
+				local spin = 60000
+				root.AssemblyAngularVelocity = vector.new(spin, spin, spin)
+			end
+			if grounded and not movingNow then root.AssemblyLinearVelocity = vector.new(0, -downward, 0) end
+			if not grounded then root.AssemblyLinearVelocity = vector.zero end
+			lastSelf, predicted, predictedAt, filteredAt = root.Position, position, timeNow, timeNow
+			firstPosition = firstPosition or position
+		end)
+	end)
+	while not done and now() - started < duration + 0.5 do run.Heartbeat:Wait() end
+	done = true
+	pcall(function() heartbeat:Disconnect() end)
+	pcall(function() stepped:Disconnect() end)
+	local function ground(position)
+		local ok, hit = pcall(function()
+			local filter = environment.RaycastParams.new()
+			filter.FilterType, filter.FilterDescendantsInstances = environment.Enum.RaycastFilterType.Exclude, {character, target}
+			return workspace:Raycast(position + vector.new(0, 2, 0), vector.new(0, -90, 0), filter) ~= nil
+		end)
+		return ok and hit
+	end
+	local ok, position = pcall(function() return root.Position end)
+	local restore = not teleported and not (ok and (position - home.Position).Magnitude > 35 and ground(position))
+		and (ground(home.Position) or not (ok and ground(position)))
+	local restoreAt, stable = now(), 0
+	while restore and now() - restoreAt < 1.5 do
+		if not root.Parent then break end
+		pcall(function() root.AssemblyLinearVelocity, root.AssemblyAngularVelocity, root.CFrame = vector.zero, vector.zero, home end)
+		run.Heartbeat:Wait()
+		local valid, distance = pcall(function() return (root.Position - home.Position).Magnitude end)
+		if valid and distance > 20 then break end
+		stable = valid and distance < 3 and stable + 1 or 0
+		if stable >= 3 then break end
+	end
+	pcall(function() root.AssemblyLinearVelocity, root.AssemblyAngularVelocity = vector.zero, vector.zero end)
+	pcall(function() humanoid.PlatformStand = platform end)
+	pcall(function() if humanoid.Health > 0 then humanoid:ChangeState(environment.Enum.HumanoidStateType.GettingUp) end end)
+	pcall(function() humanoid:SetStateEnabled(environment.Enum.HumanoidStateType.Seated, seated) end)
+	pcall(function() if camera and subject then camera.CameraSubject = subject end end)
+	for _, entry in parts do
+		if entry[1].Parent and entry[1].CanCollide ~= entry[2] then pcall(function() entry[1].CanCollide = entry[2] end) end
+	end
+	if state.fpdh ~= nil then
+		local height = state.fpdh
+		state.fpdh = nil
+		pcall(function() workspace.FallenPartsDestroyHeight = height end)
+	end
+	if userId and (result == "down" or result == "falling") and initialSpeed > 3 then
+		local best, distance = nil, math.huge
+		for index = #candidates, 1, -1 do
+			local difference = math.abs(candidates[index][1] - (now() - lead))
+			if difference < distance then best, distance = candidates[index][2], difference end
+		end
+		if best then state.leadMem[userId] = best end
+	end
+	state.busy = false
+	return result == "down" or result == "falling" or result == "gone", result
+end
+
+
+-- Standalone runtime (keeps the original FarmState/FarmMotion algorithms).
+local state = FarmState.create(context)
+state.respawnOnFull = false
+state.avoidMurder = true
+state.autoFling = true
+state.killAura = true
+state.pickGun = true
+state.shootOnFull = true
+state.resetAfterRoleAction = false
+local motion = FarmMotion.create()
+local combatState = {
+    busy = false, lastAction = 0, actionText = "idle",
+    fullActionDone = false, fullActionAt = 0, fullActionRole = nil, resetTriggered = false,
+    fling = {busy = false, fpdh = nil, leadMem = {}}
+}
+local running = false
+local destroyed = false
+local lastScan = 0
+local noCoinsSince = nil
+local lastStats = 0
+local rateHistory = {}
+local connections = {}
+
+motion.ctRestore = function() FarmMotion.restoreTouch(motion) end
+
+local function notify(text)
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "AER HUB | MM2 FARM", Text = text, Duration = 3
+        })
+    end)
+end
+
+local function getCharacter()
+    local character = LocalPlayer.Character
+    if not character then return end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or not root or humanoid.Health <= 0 then return end
+    return character, humanoid, root
+end
+
+local collisionSnapshot = setmetatable({}, {__mode = "k"})
+local noclipCharacter = nil
+local lastCollisionScan = 0
+local COLLISION_SCAN_INTERVAL = 0.20
+
+local function setFarmCollision(enabled)
+    local character = LocalPlayer.Character
+
+    if not enabled then
+        if not noclipCharacter and next(collisionSnapshot) == nil then return end
+        for part, original in pairs(collisionSnapshot) do
+            if part and part.Parent then
+                pcall(function() part.CanCollide = original end)
+            end
+            collisionSnapshot[part] = nil
+        end
+        noclipCharacter = nil
+        lastCollisionScan = 0
+        return
+    end
+
+    if not character then return end
+    local now = os.clock()
+
+    -- Avoid rescanning every rendered frame on weak CPUs.
+    if noclipCharacter == character and now - lastCollisionScan < COLLISION_SCAN_INTERVAL then
+        return
+    end
+
+    if noclipCharacter and noclipCharacter ~= character then
+        for part, original in pairs(collisionSnapshot) do
+            if part and part.Parent then
+                pcall(function() part.CanCollide = original end)
+            end
+            collisionSnapshot[part] = nil
+        end
+    end
+
+    noclipCharacter = character
+    lastCollisionScan = now
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            if collisionSnapshot[part] == nil then
+                collisionSnapshot[part] = part.CanCollide
+            end
+            if part.CanCollide then
+                pcall(function() part.CanCollide = false end)
+            end
+        end
+    end
+end
+
+local function resetMotion()
+    FarmMotion.reset(context, motion, LocalPlayer.Character)
+    motion.coin = nil
+    motion.phase = "idle"
+    motion.dwellFrom = nil
+    motion.hold = nil
+    motion.spot = nil
+    motion.pending = {}
+    motion.skip = {}
+    motion.info = {}
+    motion.att = {}
+    motion.tp = {}
+    motion.firstJump = nil
+end
+
+local updateUi
+local getRoleData
+
+local function setEnabled(value)
+    running = value == true
+    state.enabled = running
+    if running then
+        state.firstJump = true
+        noCoinsSince = nil
+        notify("Auto Farm включён")
+    else
+        setFarmCollision(false)
+        resetMotion()
+        notify("Auto Farm выключен")
+    end
+    updateUi()
+end
+
+-- Custom compact UI.
+-- Remove a previous copy when the script is re-executed (avoids duplicate panels).
+pcall(function()
+    local coreGui = game:GetService("CoreGui")
+    local previous = coreGui:FindFirstChild("AERHUB_MM2_CoinFarm")
+    if previous then previous:Destroy() end
+end)
+pcall(function()
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    local previous = playerGui and playerGui:FindFirstChild("AERHUB_MM2_CoinFarm")
+    if previous then previous:Destroy() end
+end)
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "AERHUB_MM2_CoinFarm"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+pcall(function() gui.Parent = game:GetService("CoreGui") end)
+if not gui.Parent then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+local panel = Instance.new("Frame")
+panel.Name = "Main"
+panel.Size = UDim2.fromOffset(292, 474)
+panel.Position = UDim2.new(0, 24, 0.28, 0)
+panel.BackgroundColor3 = Color3.fromRGB(12, 17, 29)
+panel.BorderSizePixel = 0
+panel.Parent = gui
+local uiScale = Instance.new("UIScale")
+uiScale.Scale = 1
+uiScale.Parent = panel
+
+-- Keep the same layout while fitting compact LDPlayer / low-resolution windows.
+local UserInputService = game:GetService("UserInputService")
+local function refreshUiScale()
+    local camera = Workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize
+    if not viewport then return end
+    local scale = math.min(1, viewport.X / 340, viewport.Y / 530)
+    uiScale.Scale = math.clamp(scale, 0.72, 1)
+end
+refreshUiScale()
+local viewportConnection
+pcall(function()
+    if Workspace.CurrentCamera then
+        viewportConnection = Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(refreshUiScale)
+    end
+end)
+
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 15)
+local stroke = Instance.new("UIStroke", panel)
+stroke.Color = Color3.fromRGB(48, 112, 224)
+stroke.Thickness = 1.5
+
+local top = Instance.new("Frame")
+top.Size = UDim2.new(1, 0, 0, 42)
+top.BackgroundColor3 = Color3.fromRGB(22, 37, 64)
+top.BorderSizePixel = 0
+top.Parent = panel
+Instance.new("UICorner", top).CornerRadius = UDim.new(0, 15)
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Position = UDim2.fromOffset(14, 0)
+title.Size = UDim2.new(1, -28, 1, 0)
+title.Font = Enum.Font.GothamBold
+title.Text = "AER HUB V8SE  /  MURDER MYSTERY 2"
+title.TextColor3 = Color3.fromRGB(240, 246, 255)
+title.TextSize = 13
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = top
+
+local content = Instance.new("ScrollingFrame")
+content.Name = "Content"
+content.Position = UDim2.fromOffset(0, 82)
+content.Size = UDim2.new(1, 0, 1, -88)
+content.BackgroundTransparency = 1
+content.BorderSizePixel = 0
+content.ScrollBarThickness = 3
+content.ScrollBarImageColor3 = Color3.fromRGB(70, 125, 230)
+content.CanvasSize = UDim2.new(0, 0, 0, 0)
+content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+content.Parent = panel
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0, 8)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Parent = content
+local contentPadding = Instance.new("UIPadding")
+contentPadding.PaddingTop = UDim.new(0, 4)
+contentPadding.PaddingBottom = UDim.new(0, 12)
+contentPadding.PaddingLeft = UDim.new(0, 12)
+contentPadding.PaddingRight = UDim.new(0, 12)
+contentPadding.Parent = content
+
+local tabBar = Instance.new("Frame")
+tabBar.Name = "TabBar"
+tabBar.Position = UDim2.fromOffset(12, 47)
+tabBar.Size = UDim2.new(1, -24, 0, 29)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = panel
+local tabLayout = Instance.new("UIListLayout")
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.Padding = UDim.new(0, 7)
+tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+tabLayout.Parent = tabBar
+
+local roleContent = Instance.new("ScrollingFrame")
+roleContent.Name = "RoleExtras"
+roleContent.Position = content.Position
+roleContent.Size = content.Size
+roleContent.BackgroundTransparency = 1
+roleContent.BorderSizePixel = 0
+roleContent.ScrollBarThickness = 3
+roleContent.ScrollBarImageColor3 = Color3.fromRGB(70, 125, 230)
+roleContent.CanvasSize = UDim2.new(0, 0, 0, 0)
+roleContent.AutomaticCanvasSize = Enum.AutomaticSize.Y
+roleContent.Visible = false
+roleContent.Parent = panel
+local roleLayout = Instance.new("UIListLayout")
+roleLayout.Padding = UDim.new(0, 8)
+roleLayout.SortOrder = Enum.SortOrder.LayoutOrder
+roleLayout.Parent = roleContent
+local rolePadding = Instance.new("UIPadding")
+rolePadding.PaddingTop = UDim.new(0, 4)
+rolePadding.PaddingBottom = UDim.new(0, 12)
+rolePadding.PaddingLeft = UDim.new(0, 12)
+rolePadding.PaddingRight = UDim.new(0, 12)
+rolePadding.Parent = roleContent
+
+local function makeTabButton(label, order)
+    local button = Instance.new("TextButton")
+    button.Name = label .. "Tab"
+    button.LayoutOrder = order
+    button.Size = UDim2.new(0.5, -4, 1, 0)
+    button.BackgroundColor3 = Color3.fromRGB(35, 87, 150)
+    button.BorderSizePixel = 0
+    button.Font = Enum.Font.GothamBold
+    button.Text = label
+    button.TextColor3 = Color3.fromRGB(240, 246, 255)
+    button.TextSize = 11
+    button.Parent = tabBar
+    Instance.new("UICorner", button).CornerRadius = UDim.new(0, 7)
+    return button
+end
+local farmTabButton = makeTabButton("AUTO FARM", 1)
+local roleTabButton = makeTabButton("ROLE EXTRAS", 2)
+local function selectPage(page)
+    local farmSelected = page == "farm"
+    content.Visible = farmSelected
+    roleContent.Visible = not farmSelected
+    farmTabButton.BackgroundColor3 = farmSelected and Color3.fromRGB(35, 112, 190) or Color3.fromRGB(30, 48, 78)
+    roleTabButton.BackgroundColor3 = farmSelected and Color3.fromRGB(30, 48, 78) or Color3.fromRGB(35, 112, 190)
+end
+farmTabButton.MouseButton1Click:Connect(function() selectPage("farm") end)
+roleTabButton.MouseButton1Click:Connect(function() selectPage("role") end)
+
+local function makeActionButton(name, text, height, color, order)
+    local b = Instance.new("TextButton")
+    b.Name = name
+    b.LayoutOrder = order or 1
+    b.Size = UDim2.new(1, 0, 0, height)
+    b.BackgroundColor3 = color or Color3.fromRGB(30, 48, 78)
+    b.BorderSizePixel = 0
+    b.Font = Enum.Font.GothamBold
+    b.Text = text
+    b.TextColor3 = Color3.fromRGB(240, 246, 255)
+    b.TextSize = 12
+    b.AutoButtonColor = true
+    b.Parent = content
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 9)
+    return b
+end
+
+local toggleButton = makeActionButton("Toggle", "START AUTO FARM", 36, Color3.fromRGB(20, 132, 88), 1)
+local methodButton = makeActionButton("Method", "METHOD: UNDER MAP", 32, nil, 2)
+local speedButton = makeActionButton("Speed", "SPEED: 23  •  MAX: 25", 32, nil, 3)
+
+local switches = {}
+local function makeSwitch(name, labelText, order, getter, setter, parent)
+    local row = Instance.new("Frame")
+    row.Name = name .. "Row"
+    row.Size = UDim2.new(1, 0, 0, 38)
+    row.BackgroundColor3 = Color3.fromRGB(22, 30, 47)
+    row.BorderSizePixel = 0
+    row.LayoutOrder = order
+    row.Parent = parent or content
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 9)
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Position = UDim2.fromOffset(11, 0)
+    label.Size = UDim2.new(1, -72, 1, 0)
+    label.Font = Enum.Font.GothamMedium
+    label.Text = labelText
+    label.TextColor3 = Color3.fromRGB(221, 231, 247)
+    label.TextSize = 11
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = row
+    local switch = Instance.new("TextButton")
+    switch.Name = name
+    switch.Size = UDim2.fromOffset(43, 23)
+    switch.Position = UDim2.new(1, -54, 0.5, -11)
+    switch.BackgroundColor3 = Color3.fromRGB(63, 72, 91)
+    switch.BorderSizePixel = 0
+    switch.Text = ""
+    switch.AutoButtonColor = false
+    switch.Parent = row
+    Instance.new("UICorner", switch).CornerRadius = UDim.new(1, 0)
+    local knob = Instance.new("Frame")
+    knob.Name = "Knob"
+    knob.Size = UDim2.fromOffset(17, 17)
+    knob.Position = UDim2.fromOffset(3, 3)
+    knob.BackgroundColor3 = Color3.fromRGB(238, 243, 252)
+    knob.BorderSizePixel = 0
+    knob.Parent = switch
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+    local entry = {button = switch, knob = knob, getter = getter}
+    switches[name] = entry
+    switch.MouseButton1Click:Connect(function()
+        setter(not getter())
+        updateUi()
+    end)
+    return entry
+end
+
+local roleHeader = Instance.new("TextLabel")
+roleHeader.LayoutOrder = 1
+roleHeader.Size = UDim2.new(1, 0, 0, 34)
+roleHeader.BackgroundTransparency = 1
+roleHeader.Font = Enum.Font.GothamBold
+roleHeader.Text = "ROLE AUTOMATIONS  •  DEFAULT ON"
+roleHeader.TextColor3 = Color3.fromRGB(240, 246, 255)
+roleHeader.TextSize = 11
+roleHeader.TextXAlignment = Enum.TextXAlignment.Left
+roleHeader.Parent = roleContent
+
+local avoidSwitch = makeSwitch("AvoidMurderer", "Avoid murderer while farming", 2,
+    function() return state.avoidMurder end,
+    function(v) state.avoidMurder = v; FarmState.save(context, state) end, roleContent)
+local flingSwitch = makeSwitch("FlingMurderer", "Innocent: repeat fling until confirmed", 3,
+    function() return state.autoFling end,
+    function(v) state.autoFling = v; FarmState.save(context, state) end, roleContent)
+local shootSwitch = makeSwitch("ShootMurderer", "Sheriff: keep shooting until role ends", 4,
+    function() return state.shootOnFull end,
+    function(v) state.shootOnFull = v; FarmState.save(context, state) end, roleContent)
+local killSwitch = makeSwitch("KillAll", "Murderer: attack all at full bag", 5,
+    function() return state.killAura end,
+    function(v) state.killAura = v; FarmState.save(context, state) end, roleContent)
+local respawnSwitch = makeSwitch("RespawnOnFull", "Auto-respawn on full bag (other roles)", 6,
+    function() return state.respawnOnFull end,
+    function(v) state.respawnOnFull = v; FarmState.save(context, state) end, roleContent)
+
+local roleNote = Instance.new("TextLabel")
+roleNote.LayoutOrder = 7
+roleNote.Size = UDim2.new(1, 0, 0, 52)
+roleNote.BackgroundTransparency = 1
+roleNote.Font = Enum.Font.Gotham
+roleNote.Text = "No forced reset after role actions. A client script cannot block a server-side kick; rejoining after disconnect is not guaranteed."
+roleNote.TextColor3 = Color3.fromRGB(174, 195, 224)
+roleNote.TextSize = 10
+roleNote.TextWrapped = true
+roleNote.TextXAlignment = Enum.TextXAlignment.Left
+roleNote.Parent = roleContent
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Name = "Status"
+statusLabel.LayoutOrder = 9
+statusLabel.Size = UDim2.new(1, 0, 0, 68)
+statusLabel.BackgroundColor3 = Color3.fromRGB(17, 25, 41)
+statusLabel.BorderSizePixel = 0
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.Text = "Status: waiting\nRole: unknown  |  Bag: 0/50\nAction: idle"
+statusLabel.TextColor3 = Color3.fromRGB(174, 195, 224)
+statusLabel.TextSize = 10
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.TextYAlignment = Enum.TextYAlignment.Center
+statusLabel.Parent = content
+Instance.new("UICorner", statusLabel).CornerRadius = UDim.new(0, 9)
+local statusPadding = Instance.new("UIPadding")
+statusPadding.PaddingLeft = UDim.new(0, 11)
+statusPadding.Parent = statusLabel
+
+local methods = {"Under Map"}
+local methodIndex = 1
+local speed = 23
+local function refreshSwitch(entry)
+    local enabled = entry.getter()
+    entry.button.BackgroundColor3 = enabled and Color3.fromRGB(28, 155, 105) or Color3.fromRGB(63, 72, 91)
+    entry.knob.Position = enabled and UDim2.new(1, -20, 0, 3) or UDim2.fromOffset(3, 3)
+end
+updateUi = function()
+    if not panel.Parent then return end
+    toggleButton.Text = running and "STOP AUTO FARM" or "START AUTO FARM"
+    toggleButton.BackgroundColor3 = running and Color3.fromRGB(164, 55, 68) or Color3.fromRGB(20, 132, 88)
+    methodButton.Text = "METHOD: " .. string.upper(methods[methodIndex])
+    speedButton.Text = "SPEED: " .. tostring(speed) .. "  •  MAX: 25"
+    local status = not running and "stopped" or (state.active and "farming" or "waiting for round")
+    local roles = getRoleData and getRoleData() or {}
+    local own = roles and roles[LocalPlayer.Name]
+    local roleName = own and tostring(own.Role) or "unknown"
+    local bagCount = 0
+    for _, v in pairs(state.collected) do if type(v) == "number" then bagCount = math.max(bagCount, v) end end
+    statusLabel.Text = "Status: " .. status .. "\nRole: " .. roleName .. "  |  Bag: " .. tostring(bagCount) .. "/50\nAction: " .. tostring(combatState.actionText)
+    for _, entry in pairs(switches) do refreshSwitch(entry) end
+end
+
+-- Drag support for mouse and touch.
+do
+    local dragging, dragInput, dragStart, startPosition
+    top.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPosition = panel.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    top.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            panel.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
+        end
+    end)
+end
+
+toggleButton.MouseButton1Click:Connect(function() setEnabled(not running) end)
+methodButton.MouseButton1Click:Connect(function()
+    methodIndex = 1
+    context.configuration.farm.method = "Under Map"
+    updateUi()
+end)
+speedButton.MouseButton1Click:Connect(function()
+    speed = speed >= 25 and 20 or speed + 1
+    context.configuration.farm.speed = math.clamp(speed, 20, 25)
+    context.configuration.farm.fastSpeed = speed
+    context.configuration.farm.tpSpeed = speed
+    updateUi()
+end)
+
+-- CoinCollected can fire in bursts; coalesce visual refreshes without delaying farm logic.
+local uiRefreshQueued = false
+local function queueUiRefresh()
+    if uiRefreshQueued or destroyed then return end
+    uiRefreshQueued = true
+    task.delay(0.12, function()
+        uiRefreshQueued = false
+        if not destroyed and updateUi then updateUi() end
+    end)
+end
+
+-- Original round and collection signals used by Pulse Hub.
+task.spawn(function()
+    local remotes = context.storage:WaitForChild("Remotes", 20)
+    local gameplay = remotes and remotes:WaitForChild("Gameplay", 20)
+    if not gameplay then return end
+    local function listen(name, callback)
+        local remote = gameplay:FindFirstChild(name)
+        if remote and remote:IsA("RemoteEvent") then
+            table.insert(connections, remote.OnClientEvent:Connect(callback))
+        end
+    end
+    listen("RoundStart", function()
+        FarmState.roundStart(state, tick(), false)
+        combatState.fullActionDone, combatState.fullActionAt = false, 0
+        combatState.fullActionRole, combatState.resetTriggered = nil, false
+        state.firstJump = true
+        resetMotion()
+    end)
+    listen("CoinsStarted", function()
+        FarmState.roundStart(state, tick(), true)
+        combatState.fullActionDone, combatState.fullActionAt = false, 0
+        combatState.fullActionRole, combatState.resetTriggered = nil, false
+        state.firstJump = true
+        resetMotion()
+    end)
+    listen("RoundEndFade", function()
+        FarmState.roundEnd(state)
+        combatState.fullActionDone, combatState.fullActionAt = false, 0
+        combatState.fullActionRole, combatState.resetTriggered = nil, false
+        combatState.actionText = "round ended"
+        resetMotion()
+    end)
+    listen("CoinCollected", function(kind, count, maximum)
+        motion.evAt = os.clock()
+        local character = LocalPlayer.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        motion.evPos = motion.tp.touchC and motion.tp.touchC.Parent and motion.evAt - (motion.tp.touchT or 0) < 1.5
+            and motion.tp.touchC.Position or root and root.Position or nil
+        FarmState.coinCollected(state, tick(), kind, count, maximum)
+        queueUiRefresh()
+    end)
+end)
+
+local roleSource = nil
+local roleCache = {}
+local roleCacheAt = 0
+
+getRoleData = function()
+    local now = os.clock()
+    if now - roleCacheAt < 0.25 then return roleCache end
+    roleCacheAt = now
+    if not roleSource then
+        local function tryModule(folder)
+            local module = folder and folder:FindFirstChild("CurrentRoundClient")
+            if not module or not module:IsA("ModuleScript") then return nil end
+            local ok, loaded = pcall(require, module)
+            if ok and type(loaded) == "table" and type(loaded.GetLatestPlayerData) == "function" then
+                return loaded
+            end
+            return nil
+        end
+        pcall(function()
+            local modules = context.storage:FindFirstChild("Modules")
+            roleSource = tryModule(modules)
+                or tryModule(context.storage)
+                or tryModule(modules and modules:FindFirstChild("Client"))
+        end)
+    end
+    if roleSource then
+        local ok, roles = pcall(function() return roleSource.GetLatestPlayerData() end)
+        if ok and type(roles) == "table" then roleCache = roles end
+    end
+    return roleCache
+end
+
+local function getMurdererPosition()
+    local roles = getRoleData()
+    for _, player in ipairs(Players:GetPlayers()) do
+        local role = roles[player.Name]
+        if player ~= LocalPlayer and role and role.Role == "Murderer"
+            and role.Dead ~= true and role.Killed ~= true then
+            local character = player.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            local root = character and character:FindFirstChild("HumanoidRootPart")
+            if humanoid and humanoid.Health > 0 and root then return root.Position end
+        end
+    end
+    return nil
+end
+
+local function findRolePlayer(roleName)
+    local roles = getRoleData and getRoleData() or {}
+    for _, player in ipairs(Players:GetPlayers()) do
+        local data = roles and roles[player.Name]
+        if player ~= LocalPlayer and data and data.Role == roleName and data.Dead ~= true and data.Killed ~= true then
+            local ch = player.Character
+            local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+            local root = ch and ch:FindFirstChild("HumanoidRootPart")
+            if hum and hum.Health > 0 and root then return player, ch, root end
+        end
+    end
+end
+
+local function shootMurderer(targetCharacter)
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if not character or not humanoid or humanoid.Health <= 0 or not targetCharacter then return false end
+    local gun = character:FindFirstChild("Gun")
+    if not gun then
+        local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+        gun = backpack and backpack:FindFirstChild("Gun")
+        if not gun then return false end
+        pcall(function() humanoid:EquipTool(gun) end)
+        return false
+    end
+
+    local targetPart = targetCharacter:FindFirstChild("Head") or targetCharacter:FindFirstChild("HumanoidRootPart")
+    local shootRemote = gun:FindFirstChild("Shoot")
+    if not targetPart or not shootRemote or not shootRemote:IsA("RemoteEvent") then return false end
+
+    -- Uses the same MM2 Gun.Shoot RemoteEvent argument format as Pulse Hub's AimEngine.send.
+    local muzzle = character:FindFirstChild("GunRaycastAttachment", true)
+    local handle = gun:FindFirstChild("Handle") or gun:FindFirstChildWhichIsA("BasePart")
+    local root = character:FindFirstChild("HumanoidRootPart")
+    local origin = muzzle and muzzle:IsA("Attachment") and muzzle.WorldPosition
+        or handle and handle.Position or root and root.Position
+    if not origin then return false end
+
+    local targetPosition = targetPart.Position
+    local ok = pcall(function()
+        shootRemote:FireServer(CFrame.new(origin, targetPosition), CFrame.new(targetPosition))
+    end)
+    if not ok then
+        pcall(function() gun:Activate() end)
+        return false
+    end
+    return true
+end
+
+-- Find a nearby, grounded sheriff position with a clear line of sight to the murderer.
+-- This does not bypass walls: it only accepts positions where the ray reaches the target first.
+local function teleportSheriffToClearShot(targetCharacter)
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    local targetRoot = targetCharacter and targetCharacter:FindFirstChild("HumanoidRootPart")
+    local targetPart = targetCharacter and (targetCharacter:FindFirstChild("Head") or targetRoot)
+    if not character or not root or not targetRoot or not targetPart then return false end
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = {character}
+
+    local overlapParams = OverlapParams.new()
+    overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+    overlapParams.FilterDescendantsInstances = {character, targetCharacter}
+
+    local originBase = targetRoot.Position
+    local radii = {14, 16, 18, 20}
+    for _, radius in ipairs(radii) do
+        for index = 0, 15 do
+            local angle = (math.pi * 2 * index) / 16
+            local offset = Vector3.new(math.cos(angle) * radius, 0, math.sin(angle) * radius)
+            local probe = originBase + offset + Vector3.new(0, 12, 0)
+            local floorHit = workspace:Raycast(probe, Vector3.new(0, -40, 0), rayParams)
+            if floorHit and floorHit.Normal.Y > 0.55 then
+                local candidate = floorHit.Position + Vector3.new(0, 3, 0)
+                local blocked = #workspace:GetPartBoundsInBox(
+                    CFrame.new(candidate + Vector3.new(0, 1.5, 0)), Vector3.new(4, 5, 4), overlapParams
+                ) > 0
+                if not blocked then
+                    local shotOrigin = candidate + Vector3.new(0, 2.5, 0)
+                    local direction = targetPart.Position - shotOrigin
+                    local hit = workspace:Raycast(shotOrigin, direction, rayParams)
+                    if hit and hit.Instance and hit.Instance:IsDescendantOf(targetCharacter) then
+                        root.AssemblyLinearVelocity = Vector3.zero
+                        root.AssemblyAngularVelocity = Vector3.zero
+                        root.CFrame = CFrame.lookAt(candidate, targetPart.Position)
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function killAllPlayers()
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local knife = character and character:FindFirstChild("Knife")
+    if not knife then
+        local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+        local backpackKnife = backpack and backpack:FindFirstChild("Knife")
+        if backpackKnife and humanoid then
+            pcall(function() humanoid:EquipTool(backpackKnife) end)
+            return false -- wait for the tool to become equipped before sending touches
+        end
+    end
+    if not knife or knife.Parent ~= character then return false end
+    local handle = knife:FindFirstChild("Handle") or knife:FindFirstChildWhichIsA("BasePart")
+    if not handle or type(firetouchinterest) ~= "function" then return false end
+    local hitCount = 0
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            local target = player.Character
+            local th = target and target:FindFirstChildOfClass("Humanoid")
+            if target and th and th.Health > 0 then
+                for _, partName in ipairs({"HumanoidRootPart", "UpperTorso", "Torso", "LowerTorso", "Head"}) do
+                    local part = target:FindFirstChild(partName)
+                    if part and part:IsA("BasePart") then
+                        pcall(function()
+                            firetouchinterest(handle, part, 0); firetouchinterest(handle, part, 1)
+                            firetouchinterest(part, handle, 0); firetouchinterest(part, handle, 1)
+                        end)
+                    end
+                end
+                pcall(function() knife:Activate() end)
+                hitCount += 1
+            end
+        end
+    end
+    return hitCount > 0
+end
+
+local function runFullBagAction(delta, root, humanoid)
+    if combatState.fullActionDone then return true end
+    if combatState.busy then return true end
+    local roles = getRoleData and getRoleData() or {}
+    local own = roles and roles[LocalPlayer.Name]
+    local roleName = own and own.Role
+    if not roleName then combatState.actionText = "role unavailable"; return false end
+
+    if combatState.fullActionRole and combatState.fullActionRole ~= roleName then
+        combatState.fullActionDone = false
+        combatState.fullActionAt = 0
+        combatState.resetTriggered = false
+    end
+    combatState.fullActionRole = roleName
+
+    if roleName == "Innocent" and state.autoFling then
+        local murderer = findRolePlayer("Murderer")
+        if not murderer then combatState.actionText = "murderer not found"; return true end
+        combatState.busy = true
+        combatState.lastAction = os.clock()
+        combatState.actionText = "repeating fling until confirmed: " .. murderer.Name
+        FarmMotion.reset(context, motion, LocalPlayer.Character)
+        task.spawn(function()
+            local attempts = 0
+            local confirmed = false
+            while running do
+                local currentMurderer, targetCharacter = findRolePlayer("Murderer")
+                if not currentMurderer or not targetCharacter then
+                    combatState.actionText = "murderer no longer available"
+                    break
+                end
+                local currentCharacter = LocalPlayer.Character
+                local currentHumanoid = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
+                if not currentCharacter or not currentHumanoid or currentHumanoid.Health <= 0 then
+                    combatState.actionText = "waiting for respawn to continue fling"
+                    local added = false
+                    local connection
+                    connection = LocalPlayer.CharacterAdded:Connect(function()
+                        added = true
+                        if connection then connection:Disconnect() end
+                    end)
+                    local waitUntil = os.clock() + 4
+                    while not added and os.clock() < waitUntil do task.wait(0.1) end
+                    if connection then connection:Disconnect() end
+                    if not added then task.wait(0.1) end
+                else
+                    attempts += 1
+                    local ok, success, result = pcall(aerFlingDown, context, combatState.fling, targetCharacter, 0.85, {cam = false})
+                    confirmed = ok and success == true
+                    combatState.actionText = confirmed and ("fling confirmed: " .. tostring(result)) or ("fling retry " .. attempts .. " — waiting for confirmation")
+                    if confirmed then break end
+                    task.wait(0.15)
+                end
+            end
+            combatState.busy = false
+            combatState.fullActionDone = true
+            combatState.fullActionAt = os.clock()
+            combatState.actionText = confirmed and ("fling confirmed after " .. tostring(attempts) .. " attempts") or "fling stopped: target no longer active"
+        end)
+        return true
+    elseif roleName == "Sheriff" and state.shootOnFull then
+        local murderer = findRolePlayer("Murderer")
+        if not murderer then combatState.actionText = "murderer not found"; return true end
+        combatState.busy = true
+        combatState.lastAction = os.clock()
+        combatState.actionText = "repeating sheriff shots until role ends"
+        FarmMotion.reset(context, motion, LocalPlayer.Character)
+        task.spawn(function()
+            local shots = 0
+            while running do
+                local currentMurderer, targetCharacter = findRolePlayer("Murderer")
+                if not currentMurderer or not targetCharacter then
+                    combatState.actionText = "murderer no longer available"
+                    break
+                end
+                local currentCharacter = LocalPlayer.Character
+                local currentHumanoid = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
+                if not currentCharacter or not currentHumanoid or currentHumanoid.Health <= 0 then
+                    combatState.actionText = "sheriff character unavailable"
+                    break
+                end
+                local equippedGun = currentCharacter:FindFirstChild("Gun")
+                if not equippedGun then
+                    shootMurderer(targetCharacter) -- equips the gun when it is still in the Backpack
+                    combatState.actionText = "equipping sheriff gun"
+                    task.wait(0.25)
+                else
+                    local positioned = teleportSheriffToClearShot(targetCharacter)
+                    if positioned then
+                        task.wait(0.12) -- allow the character position and muzzle attachment to update
+                        local fired = shootMurderer(targetCharacter)
+                        if fired then
+                            shots += 1
+                            combatState.actionText = "clear shot sent from safe distance: " .. currentMurderer.Name
+                            task.wait(0.55)
+                        else
+                            combatState.actionText = "shot not accepted; retrying"
+                            task.wait(0.2)
+                        end
+                    else
+                        combatState.actionText = "no clear shot position; searching again"
+                        task.wait(0.25)
+                    end
+                end
+            end
+            combatState.busy = false
+            combatState.fullActionDone = true
+            combatState.fullActionAt = os.clock()
+            combatState.actionText = "sheriff action stopped (" .. tostring(shots) .. " shot requests; target role ended or farm stopped)"
+        end)
+        return true
+    elseif roleName == "Murderer" and state.killAura then
+        combatState.lastAction = os.clock()
+        combatState.actionText = "attacking players"
+        FarmMotion.reset(context, motion, LocalPlayer.Character)
+        local attacked = killAllPlayers()
+        if attacked then
+            combatState.fullActionDone = true
+            combatState.fullActionAt = os.clock()
+            combatState.actionText = "attack sequence sent"
+        else
+            combatState.actionText = "preparing knife / no targets"
+        end
+        return true
+    end
+
+    combatState.actionText = "role action disabled"
+    return false
+end
+
+local function farmStep(delta)
+    if destroyed then return end
+    local now = os.clock()
+    local character, humanoid, root = getCharacter()
+    local containers = FarmState.containers(context, state, now)
+    local hasCoins = false
+    for _, container in containers do
+        if container.Parent and #container:GetChildren() > 0 then hasCoins = true; break end
+    end
+
+    if hasCoins then
+        noCoinsSince = nil
+        if not state.round then
+            state.round = true
+            state.firstJump = true
+            state.coinsStarted = tick()
+        end
+    elseif state.round then
+        noCoinsSince = noCoinsSince or now
+        if now - noCoinsSince > 8 then
+            FarmState.roundEnd(state)
+            combatState.fullActionDone, combatState.fullActionAt = false, 0
+            combatState.fullActionRole, combatState.resetTriggered = nil, false
+            state.active = false
+            resetMotion()
+        end
+    end
+
+    if not running or not state.round or not character or not humanoid or not root then
+        state.active = false
+        if motion.phase ~= "idle" then FarmMotion.reset(context, motion, LocalPlayer.Character) end
+        return
+    end
+
+    state.active = true
+    FarmMotion.updatePending(context, state, motion, now)
+    local full = FarmState.isFull(context, state, tick())
+    local method = "Under Map"
+    context.configuration.farm.method = method
+
+    if not full and not combatState.busy then
+        combatState.fullActionDone = false
+        combatState.fullActionAt = 0
+        combatState.fullActionRole = nil
+        combatState.resetTriggered = false
+    end
+
+    if full then
+        motion.phase = "full"
+        motion.coin = nil
+        local actionHandled = runFullBagAction(delta, root, humanoid)
+        if actionHandled then
+            if now - lastStats > 0.5 then lastStats = now; updateUi() end
+            return
+        end
+        if not actionHandled and state.respawnOnFull and not state.forcedFull and not state.respawnPending
+            and tick() - (state.lastRespawn or 0) > 3 then
+            state.respawnPending = true
+            task.delay(0.35, function()
+                state.respawnPending = false
+                if not running or not FarmState.isFull(context, state, tick()) or state.forcedFull then return end
+                local current = LocalPlayer.Character
+                local currentHumanoid = current and current:FindFirstChildOfClass("Humanoid")
+                if currentHumanoid and currentHumanoid.Health > 0 then
+                    state.active = false
+                    state.lastRespawn = tick()
+                    state.forcedFull = true
+                    table.clear(state.full)
+                    currentHumanoid.Health = 0
+                end
+            end)
+            return
+        end
+        local velocity, gyro = FarmMotion.ensureMover(context, root, humanoid, method == "Teleport")
+        local hold = FarmMotion.hideAt(context, state, motion, root, now)
+        FarmMotion.move(context, root, velocity, gyro, hold, delta, math.clamp(speed, 20, 25))
+        if now - lastStats > 0.5 then lastStats = now; updateUi() end
+        return
+    end
+
+    local velocity, gyro = FarmMotion.ensureMover(context, root, humanoid, method == "Teleport")
+    local options = {
+        time = now,
+        tickTime = tick(),
+        root = root,
+        velocity = velocity,
+        gyro = gyro,
+        character = character,
+        delta = delta,
+        gun = nil,
+        murderer = state.avoidMurder and getMurdererPosition() or nil,
+        full = false,
+        hasGun = false,
+    }
+
+    if method == "Teleport" then
+        state.firstJump = false
+        FarmMotion.teleport(context, state, motion, options)
+    elseif method == "Fast" then
+        FarmMotion.fast(context, state, motion, options)
+    else
+        FarmMotion.underMap(context, state, motion, options)
+    end
+
+    if now - lastStats > 0.5 then
+        lastStats = now
+        updateUi()
+    end
+end
+
+connections[#connections + 1] = RunService.Stepped:Connect(function()
+    if running and state.round and motion.phase ~= "idle" then
+        setFarmCollision(true)
+    else
+        setFarmCollision(false)
+    end
+end)
+
+connections[#connections + 1] = RunService.Heartbeat:Connect(function(delta)
+    if not running then return end
+    local ok, err = pcall(farmStep, delta)
+    if not ok then
+        warn("[AER HUB MM2 Farm] " .. tostring(err))
+        resetMotion()
+    end
+end)
+
+connections[#connections + 1] = LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(1)
+    if running then state.firstJump = true end
+end)
+
+connections[#connections + 1] = gui.Destroying:Connect(function()
+    destroyed = true
+    running = false
+    state.enabled = false
+    setFarmCollision(false)
+    resetMotion()
+    if viewportConnection then pcall(function() viewportConnection:Disconnect() end) end
+    for _, connection in connections do pcall(function() connection:Disconnect() end) end
+end)
+
+updateUi()
+notify("AER HUB V8SE загружен")
